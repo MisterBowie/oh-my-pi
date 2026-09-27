@@ -8,6 +8,65 @@ const nativeDir = path.join(import.meta.dir, "../native");
 const archivePrefix = "embedded-addons.";
 const archiveSuffix = ".tar.gz";
 
+/** Byte offset of the ustar header's 12-byte mtime field. */
+const TAR_MTIME_OFFSET = 136;
+/** Length of every ustar header block, and of the numeric mtime field inside it. */
+const TAR_BLOCK_BYTES = 512;
+const TAR_MTIME_LENGTH = 12;
+/** Byte offset and length of the ustar header's size field. */
+const TAR_SIZE_OFFSET = 124;
+const TAR_SIZE_LENGTH = 12;
+/** Byte offset, length, and blanked representation of the ustar header checksum field. */
+const TAR_CHECKSUM_OFFSET = 148;
+const TAR_CHECKSUM_LENGTH = 8;
+const TAR_BLANK = 0x20;
+const TAR_ZERO = 0x30;
+
+/** Octal numeric field of a ustar header block, as a number. */
+function readTarOctal(block: Uint8Array, offset: number, length: number, label: string): number {
+	const raw = Buffer.from(block.subarray(offset, offset + length)).toString("ascii");
+	const text = raw.slice(0, raw.indexOf("\0") === -1 ? raw.length : raw.indexOf("\0")).trim();
+	if (text === "") return 0;
+	if (!/^[0-7]+$/.test(text)) throw new Error(`Embedded addon archive has a non-octal ${label} field: ${raw}`);
+	return Number.parseInt(text, 8);
+}
+
+/**
+ * Build the addon archive with fixed entry timestamps.
+ *
+ * `Bun.Archive` stamps every entry with the time the archive was written — and
+ * checksums the header that carries it — so two embeddings of unchanged addons
+ * produced different `tar.gz` bytes and, because the archive is embedded
+ * verbatim, different binaries. The tar layout is still `Bun.Archive`'s; each
+ * header's mtime is normalized to `0` and its checksum recomputed, which is
+ * what a reproducible archive is. Nothing else reads those fields: the runtime
+ * extractor takes entry names, sizes and payloads only
+ * (`native/loader-state.js`), and the version sentinel decides staleness.
+ */
+async function buildAddonArchive(entries: Record<string, Uint8Array>): Promise<Uint8Array> {
+	const tar = new Uint8Array(await new Bun.Archive(entries).bytes());
+	for (let offset = 0; offset + TAR_BLOCK_BYTES <= tar.length;) {
+		const header = tar.subarray(offset, offset + TAR_BLOCK_BYTES);
+		// Two zero blocks terminate the archive; the first byte being 0 is enough
+		// to stop, exactly as the extractor decides it.
+		if (header[0] === 0) break;
+		const size = readTarOctal(header, TAR_SIZE_OFFSET, TAR_SIZE_LENGTH, "size");
+		header.fill(TAR_ZERO, TAR_MTIME_OFFSET, TAR_MTIME_OFFSET + TAR_MTIME_LENGTH - 1);
+		header[TAR_MTIME_OFFSET + TAR_MTIME_LENGTH - 1] = 0;
+		header.fill(TAR_BLANK, TAR_CHECKSUM_OFFSET, TAR_CHECKSUM_OFFSET + TAR_CHECKSUM_LENGTH);
+		let checksum = 0;
+		for (const byte of header) checksum += byte;
+		const digits = checksum.toString(8).padStart(TAR_CHECKSUM_LENGTH - 2, "0");
+		for (let index = 0; index < digits.length; index += 1) {
+			header[TAR_CHECKSUM_OFFSET + index] = digits.charCodeAt(index);
+		}
+		header[TAR_CHECKSUM_OFFSET + TAR_CHECKSUM_LENGTH - 2] = 0;
+		header[TAR_CHECKSUM_OFFSET + TAR_CHECKSUM_LENGTH - 1] = TAR_BLANK;
+		offset += TAR_BLOCK_BYTES + Math.ceil(size / TAR_BLOCK_BYTES) * TAR_BLOCK_BYTES;
+	}
+	return new Uint8Array(Bun.gzipSync(tar, { level: 9 }));
+}
+
 const embeddedAddonTypedefs = `/** @typedef {"modern" | "baseline" | "default"} EmbeddedAddonVariant */
 
 /**
@@ -121,7 +180,7 @@ export async function embedNativeAddon({
 		}
 		archiveEntries[addon.filename] = bytes;
 	}
-	await Bun.write(archivePath, await new Bun.Archive(archiveEntries, { compress: "gzip", level: 9 }).bytes());
+	await Bun.write(archivePath, await buildAddonArchive(archiveEntries));
 
 	const files = available
 		.map(

@@ -40,6 +40,48 @@ export function resolveCrossBuild(value: string | undefined): CrossBuild | null 
 	}
 }
 
+/** Raised for anything the build-binary command line does not accept. */
+export class BuildBinaryArgsError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "BuildBinaryArgsError";
+	}
+}
+
+/** Switches `build-binary.ts` accepts on the command line. */
+export interface BuildBinaryOptions {
+	/**
+	 * Embed precompiled bytecode; `--no-bytecode` turns it off for callers that
+	 * need two builds of one revision to be bit-identical (see
+	 * `CodingAgentCompileOptions.bytecode`).
+	 */
+	readonly bytecode: boolean;
+}
+
+/**
+ * Parse the build switches, refusing anything else.
+ *
+ * The mode is an explicit, single-valued switch rather than an environment
+ * variable: a release artifact must not change because a variable happened to
+ * be set, and a typo (`--no-bytecod`) must fail the build rather than silently
+ * ship the default.
+ */
+export function parseBuildBinaryArgs(argv: readonly string[]): BuildBinaryOptions {
+	let bytecode = true;
+	let bytecodeGiven = false;
+	for (const arg of argv) {
+		if (arg !== "--bytecode" && arg !== "--no-bytecode") {
+			throw new BuildBinaryArgsError(`Unsupported build-binary argument: ${arg}`);
+		}
+		if (bytecodeGiven) {
+			throw new BuildBinaryArgsError(`Bytecode mode was already given; refusing redundant ${arg}`);
+		}
+		bytecodeGiven = true;
+		bytecode = arg === "--bytecode";
+	}
+	return { bytecode };
+}
+
 // Transformers.js is an optional, native-heavy dependency that is never bundled
 // into the binary; the tiny-model worker `bun install`s it into a runtime cache
 // on first use. The `catalog:` spec cannot be resolved from inside the compiled
@@ -74,6 +116,7 @@ async function runCommand(
 }
 
 async function main(): Promise<void> {
+	const options = parseBuildBinaryArgs(Bun.argv.slice(2));
 	const crossBuild = resolveCrossBuild(Bun.env.CROSS_TARGET);
 	const shouldAdhocSign =
 		process.platform === "darwin" &&
@@ -103,6 +146,7 @@ async function main(): Promise<void> {
 				target: crossBuild?.target,
 				executablePath: Bun.env.BUN_COMPILE_EXECUTABLE_PATH || undefined,
 				skipBuiltinCodesign: shouldAdhocSign,
+				bytecode: options.bytecode,
 			});
 
 			if (shouldAdhocSign) {
@@ -124,4 +168,17 @@ async function main(): Promise<void> {
 	}
 }
 
-if (import.meta.main) await main();
+if (import.meta.main) {
+	// A refused switch must fail the build loudly: `Bun.argv` errors are
+	// reported with a stable prefix and a distinct exit code so a caller can
+	// tell "this build was invoked wrong" from "the compile itself failed".
+	try {
+		await main();
+	} catch (error) {
+		if (error instanceof BuildBinaryArgsError) {
+			console.error(`OMP-BUILD-ARGS ${error.message}`);
+			process.exit(2);
+		}
+		throw error;
+	}
+}

@@ -26,6 +26,18 @@ export interface CodingAgentCompileOptions {
 	readonly minifyIdentifiers?: boolean;
 	/** Disable Bun's built-in Darwin signing before the caller re-signs. */
 	readonly skipBuiltinCodesign?: boolean;
+	/**
+	 * Precompile the bundle to bytecode (default `true`, the release behavior).
+	 *
+	 * Bytecode costs ~52 MB of binary size to skip parsing the bundle at boot.
+	 * It is also the only difference between two builds of the same source:
+	 * Bun 1.4.2 bakes build-local placeholders into the bytecode string table,
+	 * so a caller that needs one bit-identical artifact per source revision —
+	 * `OMP Desktop`'s bundled sidecar — passes `false` explicitly. The switch is
+	 * per-call and never reads the environment, so a stray variable cannot
+	 * change what a release build ships.
+	 */
+	readonly bytecode?: boolean;
 }
 
 /**
@@ -51,7 +63,7 @@ export async function compileCodingAgent(options: CodingAgentCompileOptions): Pr
 			// `omp --version` 256 ms -> 30 ms on M4 Max (+52 MB binary).
 			// Keep import.meta.resolve in bundled dependencies valid under bytecode.
 			format: "esm",
-			bytecode: true,
+			bytecode: options.bytecode ?? true,
 			minify: {
 				identifiers: options.minifyIdentifiers ?? false,
 				keepNames: true,
