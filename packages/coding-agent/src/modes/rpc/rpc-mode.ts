@@ -42,7 +42,7 @@ import { selectRpcEntries } from "./rpc-compat";
 import { calculateTokensPerSecond } from "../../utils/token-rate";
 import { formatPersistenceDurabilityFailure, formatPersistenceFailure } from "../persistence-failure";
 import { initializeExtensions } from "../runtime-init";
-import { isRpcHostToolResult, isRpcHostToolUpdate, RpcHostToolBridge } from "./host-tools";
+import { isRpcHostToolResult, isRpcHostToolUpdate, normalizeHostToolPolicy, RpcHostToolBridge } from "./host-tools";
 import { isRpcHostUriResult, RpcHostUriBridge } from "./host-uris";
 import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameEncoder } from "./rpc-frame";
 import { claimRpcInput, readRpcInputFrames } from "./rpc-input";
@@ -574,7 +574,12 @@ export async function handleRpcSessionChange(
 	throw new Error("Unsupported RPC session change command");
 }
 
-function normalizeHostToolDefinitions(tools: RpcHostToolDefinition[]): RpcHostToolDefinition[] {
+/**
+ * Normalize and validate a `set_host_tools` payload at the trusted boundary.
+ * Throws for any malformed declaration, which fails the whole request before
+ * the tool registry is touched.
+ */
+export function normalizeHostToolDefinitions(tools: RpcHostToolDefinition[]): RpcHostToolDefinition[] {
 	return tools.map((tool, index) => {
 		const name = typeof tool.name === "string" ? tool.name.trim() : "";
 		if (!name) {
@@ -588,6 +593,7 @@ function normalizeHostToolDefinitions(tools: RpcHostToolDefinition[]): RpcHostTo
 			throw new Error(`Host tool "${name}" must provide a JSON Schema object`);
 		}
 		const label = typeof tool.label === "string" && tool.label.trim() ? tool.label.trim() : name;
+		const policy = normalizeHostToolPolicy(name, tool);
 		return {
 			name,
 			label,
@@ -596,6 +602,7 @@ function normalizeHostToolDefinitions(tools: RpcHostToolDefinition[]): RpcHostTo
 			hidden: tool.hidden === true,
 			loadMode: defaultLoadModeForToolName(name, tool.loadMode),
 			readsSkillUris: tool.readsSkillUris,
+			...policy,
 		};
 	});
 }

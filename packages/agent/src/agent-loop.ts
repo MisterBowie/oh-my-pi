@@ -532,6 +532,12 @@ function coerceToolResult(raw: unknown): { result: AgentToolResult<unknown>; mal
 	// Tools may flag the result contextually useless (zero matches, elapsed
 	// wait) so compaction can elide it once consumed. Errors are never useless.
 	const useless = Boolean(rawObj && "useless" in rawObj && rawObj.useless);
+	// A settled result may ask for the run to end after this batch (see
+	// `AgentToolResult.terminate`). Preserved like `isError` so the loop reads it
+	// off the same normalized object it emits. The malformed branch below drops
+	// it: a result with no usable content is a protocol error, not a terminal
+	// result, and its own isError already fails the call.
+	const terminate = Boolean(rawObj && "terminate" in rawObj && rawObj.terminate);
 
 	if (!Array.isArray(rawContent)) {
 		return {
@@ -588,6 +594,7 @@ function coerceToolResult(raw: unknown): { result: AgentToolResult<unknown>; mal
 			providerMetadata,
 			...(isError ? { isError: true } : {}),
 			...(useless && !isError ? { useless: true } : {}),
+			...(terminate ? { terminate: true } : {}),
 		},
 		malformed: invalidBlocks > 0 || providerMetadataResult.malformed,
 	};
@@ -1217,12 +1224,13 @@ async function runLoopBody(
 				newMessages.push(result);
 			}
 			await emitTurnEnd(stream, currentContext, resumeTail, executionResult.toolResults, config, signal, {
-				willContinue: !isDeadlineExceeded(config.deadline),
+				willContinue: !executionResult.terminate && !isDeadlineExceeded(config.deadline),
 			});
 			turnOpen = false;
 			// A tool hook may mark its completed result as terminal (e.g. subagent
-			// yield) — same stop-before-next-model-call rule as the main loop.
-			if (signal?.reason === TERMINAL_TOOL_RESULT_ABORT_REASON) {
+			// yield), and a settled result may request termination — same
+			// stop-before-next-model-call rule as the main loop.
+			if (signal?.reason === TERMINAL_TOOL_RESULT_ABORT_REASON || executionResult.terminate) {
 				endAgentStream(stream, newMessages, telemetry, stepCounter.count);
 				return;
 			}
@@ -1527,6 +1535,7 @@ async function runLoopBody(
 				const softNonCompliant = softGateActive && !calledOnlyRequiredTool;
 
 				const toolResults: ToolResultMessage[] = [];
+				let terminateRun = false;
 				if (softNonCompliant && softRequiredTool !== undefined) {
 					SpeculativeOperationCoordinator.discardForMessage(message, "soft tool requirement deferred execution");
 					if (softRequirementState.escalations >= MAX_SOFT_TOOL_ESCALATIONS) {
@@ -1571,6 +1580,7 @@ async function runLoopBody(
 					);
 
 					toolResults.push(...executionResult.toolResults);
+					terminateRun = executionResult.terminate;
 
 					for (const result of toolResults) {
 						currentContext.messages.push(result);
@@ -1602,9 +1612,11 @@ async function runLoopBody(
 					}
 				}
 
-				// A tool hook may mark its completed result as terminal (e.g. subagent yield).
-				// Stop before the next provider call without changing external/user abort semantics.
-				if (signal?.reason === TERMINAL_TOOL_RESULT_ABORT_REASON) {
+				// A tool hook may mark its completed result as terminal (e.g. subagent yield),
+				// and a settled tool result may request termination (e.g. a host tool that
+				// ended the turn it was asked to finish). Both stop before the next provider
+				// call without changing external/user abort semantics.
+				if (signal?.reason === TERMINAL_TOOL_RESULT_ABORT_REASON || terminateRun) {
 					hasMoreToolCalls = false;
 				}
 
@@ -1629,6 +1641,16 @@ async function runLoopBody(
 					willContinue: hasMoreToolCalls && !isDeadlineExceeded(config.deadline),
 				});
 				turnOpen = false;
+
+				if (terminateRun) {
+					// A terminating batch ends the whole run: the turn already closed
+					// above as a normal completion (no rewritten stopReason, no abort),
+					// and no further provider call is made. Queued steering and follow-
+					// ups stay in their queues for the next run, exactly like a batch
+					// that ended on an external interrupt.
+					endAgentStream(stream, newMessages, telemetry, stepCounter.count);
+					return;
+				}
 
 				if (isDeadlineExceeded(config.deadline)) {
 					endAgentStream(stream, newMessages, telemetry, stepCounter.count);
@@ -1939,8 +1961,18 @@ async function streamAssistantResponse(
 				}
 				argStreams.clear();
 			};
+			// A sole-declared tool makes this message's admission a whole-batch
+			// decision, and speculation starts physical work (`#drain` ->
+			// `policy.execute`) while the message is still streaming — before the
+			// batch composition is known. The two cannot coexist: while the active
+			// tool set advertises such a tool, this provider call runs without
+			// speculation, so a rejected batch can never have speculative work
+			// started for it. Sessions without sole-declared tools are unchanged.
 			const speculationConfig =
-				config.speculativeToolExecution?.enabled === true ? config.speculativeToolExecution : undefined;
+				config.speculativeToolExecution?.enabled === true &&
+				!(context.tools ?? []).some(tool => tool.batchPolicy === "sole")
+					? config.speculativeToolExecution
+					: undefined;
 			const speculationCoordinator = speculationConfig
 				? new SpeculativeOperationCoordinator(speculationConfig, {
 						context,
@@ -2686,6 +2718,55 @@ function formatToolNotFoundMessage(
 }
 
 /**
+ * Every `toolCall` block of an assistant message, in order — the batch the
+ * sole-call rule counts.
+ *
+ * This deliberately includes blocks the loop never dispatches (notably
+ * `kCursorExecResolved` ones, which the Cursor exec channel already ran
+ * server-side): PI counts `assistantMessage.content` without exclusions, and a
+ * pre-executed sibling is still a sibling. Excluding them would let a sole tool
+ * run in a batch that has one.
+ */
+function batchToolCalls(assistantMessage: AssistantMessage): AgentToolCall[] {
+	return assistantMessage.content.filter(
+		(block): block is Extract<AssistantMessage["content"][number], { type: "toolCall" }> => block.type === "toolCall",
+	);
+}
+
+/**
+ * The batch's admission entries: one `{ name, sole }` per toolCall block,
+ * resolved through the same tool lookup the dispatch uses. Shared by the
+ * pre-dispatch admission check and the execution-time guard so both read the
+ * same batch.
+ */
+function batchAdmissionEntries(
+	assistantMessage: AssistantMessage,
+	tools: AgentTool<any>[] | undefined,
+	resolveFallbackTool: AgentLoopConfig["resolveFallbackTool"],
+): Array<{ name: string; sole: boolean }> {
+	return batchToolCalls(assistantMessage).map(toolCall => ({
+		name: toolCall.name,
+		sole: resolveToolForCall(tools, toolCall, resolveFallbackTool)?.batchPolicy === "sole",
+	}));
+}
+
+/**
+ * Batch admission rule for one assistant message.
+ *
+ * A tool declaring `batchPolicy: "sole"` may only run as the single tool call
+ * of its message; a batch that carries one plus any sibling is rejected whole.
+ * Pure over the batch's own declarations, so the pre-dispatch admission check
+ * (which decides whether the host hook is consulted at all) and the
+ * execution-time guard cannot disagree. Returns the rejection reason, or
+ * `undefined` when the batch is admitted.
+ */
+function soleBatchRejectionReason(batch: ReadonlyArray<{ name: string; sole: boolean }>): string | undefined {
+	const soleNames = [...new Set(batch.filter(entry => entry.sole).map(entry => entry.name))];
+	if (soleNames.length === 0 || batch.length === 1) return undefined;
+	return `${soleNames.join(", ")} must be the only tool call in the assistant message.`;
+}
+
+/**
  * Pre-dispatch phase for every pending tool call on `assistantMessage`, run in
  * call order: intent extraction, argument validation, and the `beforeToolCall`
  * hook. A hook `args` revision is revalidated against the tool schema and
@@ -2703,12 +2784,32 @@ async function prepareToolCallDispatch(
 ): Promise<Map<string, PreparedToolCall>> {
 	const { resolveFallbackTool, suggestFallbackToolNames, intentTracing, beforeToolCall } = config;
 	const prepared = new Map<string, PreparedToolCall>();
-	for (const toolCall of assistantMessage.content) {
-		if (toolCall.type !== "toolCall") continue;
-		if ((toolCall as CursorExecResolvedCarrier)[kCursorExecResolved] === true) continue;
-		const tool = resolveToolForCall(context.tools, toolCall, resolveFallbackTool);
+	// Resolve the batch before any per-call work: admission is a property of the
+	// message, and a rejected batch must not reach the host hook (no approval
+	// prompt for a call that can never run) or argument validation. The verdict
+	// counts every toolCall block (see `batchToolCalls`); the dispatch map below
+	// only carries the calls this loop may run.
+	const toolsByCallId = new Map<string, AgentTool<any> | undefined>();
+	for (const content of assistantMessage.content) {
+		if (content.type !== "toolCall") continue;
+		if ((content as CursorExecResolvedCarrier)[kCursorExecResolved] === true) continue;
+		toolsByCallId.set(content.id, resolveToolForCall(context.tools, content, resolveFallbackTool));
+	}
+	const batchRejection = soleBatchRejectionReason(
+		batchAdmissionEntries(assistantMessage, context.tools, resolveFallbackTool),
+	);
+	for (const content of assistantMessage.content) {
+		if (content.type !== "toolCall") continue;
+		if ((content as CursorExecResolvedCarrier)[kCursorExecResolved] === true) continue;
+		const toolCall = content;
+		const tool = toolsByCallId.get(toolCall.id);
 		const entry: PreparedToolCall = { tool, args: toolCall.arguments as Record<string, unknown> };
 		prepared.set(toolCall.id, entry);
+		if (batchRejection !== undefined) {
+			entry.blocked = true;
+			entry.blockReason = batchRejection;
+			continue;
+		}
 		let argsForExecution = toolCall.arguments as Record<string, unknown>;
 		if (intentTracing) {
 			const { intent, strippedArgs } = extractIntent(toolCall.arguments);
@@ -2860,7 +2961,7 @@ async function executeToolCalls(
 	config: AgentLoopConfig,
 	telemetry: AgentTelemetry | undefined,
 	invokeAgentSpan: Span | undefined,
-): Promise<{ toolResults: ToolResultMessage[] }> {
+): Promise<{ toolResults: ToolResultMessage[]; terminate: boolean }> {
 	const tools = currentContext.tools;
 	const {
 		hasSteeringMessages,
@@ -3029,18 +3130,20 @@ async function executeToolCalls(
 		await checkAsideInterrupts();
 	};
 
-	const emitToolResult = (record: (typeof records)[number], result: AgentToolResult<any>, isError: boolean): void => {
+	/**
+	 * Emit a record's settled result: its `tool_execution_end` event and the
+	 * tool-result message pair. The caller owns `tool_execution_start` — a call
+	 * rejected before scheduling (batch admission below) must not claim it
+	 * started, while every call that reached execution pairs its own start with
+	 * this end.
+	 */
+	const emitSettledToolResult = (
+		record: (typeof records)[number],
+		result: AgentToolResult<any>,
+		isError: boolean,
+	): void => {
 		if (record.resultEmitted) return;
 		const { toolCall } = record;
-		if (!record.started) {
-			stream.push({
-				type: "tool_execution_start",
-				toolCallId: toolCall.id,
-				toolName: toolCall.name,
-				args: record.args,
-				intent: toolCall.intent,
-			});
-		}
 		stream.push({
 			type: "tool_execution_end",
 			toolCallId: toolCall.id,
@@ -3069,6 +3172,56 @@ async function executeToolCalls(
 		stream.push({ type: "message_start", message: toolResultMessage });
 		stream.push({ type: "message_end", message: toolResultMessage });
 	};
+
+	/**
+	 * Emit a result for a call that may have reached execution: pairs a missing
+	 * `tool_execution_start` (validation failures and interrupt skips never
+	 * started) with the settled result above.
+	 */
+	const emitToolResult = (record: (typeof records)[number], result: AgentToolResult<any>, isError: boolean): void => {
+		if (record.resultEmitted) return;
+		if (!record.started) {
+			stream.push({
+				type: "tool_execution_start",
+				toolCallId: record.toolCall.id,
+				toolName: record.toolCall.name,
+				args: record.args,
+				intent: record.toolCall.intent,
+			});
+		}
+		emitSettledToolResult(record, result, isError);
+	};
+
+	// Batch admission, authoritative at the last gate before scheduling: a tool
+	// declaring `batchPolicy: "sole"` may only run as the single call of its
+	// assistant message, and a batch that carries one plus any sibling is
+	// rejected whole — the sole call, its siblings, unknown names and invalid
+	// arguments alike. Nothing this loop dispatches executes, nothing starts
+	// (`tool_execution_start` is deliberately not emitted: no call started), and
+	// every dispatched call of the batch is answered with the same blocked error
+	// result, in call order, so the provider still gets a well-formed
+	// tool_use/tool_result pairing for each. The verdict counts every toolCall
+	// block of the message, not just the dispatched records: a pre-executed
+	// sibling (e.g. a `kCursorExecResolved` call the Cursor exec channel already
+	// ran) still rejects the batch, matching PI's count of the whole message.
+	const batchRejection = soleBatchRejectionReason(batchAdmissionEntries(assistantMessage, tools, resolveFallbackTool));
+	if (batchRejection !== undefined) {
+		SpeculativeOperationCoordinator.discardForMessage(
+			assistantMessage,
+			"batch rejected by a sole-call policy",
+			"discarded",
+		);
+		for (const record of records) {
+			record.skipped = true;
+			recordSkippedTool(telemetry, {
+				toolCallId: record.toolCall.id,
+				toolName: record.toolCall.name,
+				status: "blocked",
+			});
+			emitSettledToolResult(record, { content: [{ type: "text", text: batchRejection }], details: {} }, true);
+		}
+		return { toolResults: emittedToolResults, terminate: false };
+	}
 
 	const runTool = async (record: (typeof records)[number], index: number): Promise<void> => {
 		// A pending interrupt preempts not-yet-started *interruptible* waits so
@@ -3210,12 +3363,17 @@ async function executeToolCalls(
 							executionArgs,
 							record.signal,
 							partialResult => {
+								const partial = coerceToolResult(partialResult).result;
+								// A streaming partial can never terminate: only the settled
+								// result ends the run. Drop the flag so consumers of
+								// `tool_execution_update` cannot read one as terminal.
+								if (partial.terminate !== undefined) partial.terminate = undefined;
 								stream.push({
 									type: "tool_execution_update",
 									toolCallId: toolCall.id,
 									toolName: toolCall.name,
 									args: executionArgs,
-									partialResult: coerceToolResult(partialResult).result,
+									partialResult: partial,
 								});
 							},
 							toolContext,
@@ -3261,6 +3419,7 @@ async function executeToolCalls(
 							isError: after.isError ?? result.isError,
 							providerMetadata: after.providerMetadata ?? result.providerMetadata,
 							useless: after.useless ?? result.useless,
+							terminate: after.terminate ?? result.terminate,
 						});
 						result = coerced.result;
 						isError = coerced.malformed || (after.isError ?? isError);
@@ -3449,7 +3608,12 @@ async function executeToolCalls(
 	}
 	await speculationCoordinator?.discardAll("candidate was not dispatched");
 
-	return { toolResults: emittedToolResults };
+	// A settle-time terminate request ends the run after this batch. Read from
+	// the emitted results, so an `afterToolCall` override and an interrupted
+	// batch both contribute exactly what the model will see.
+	const terminate = records.some(record => record.result?.terminate === true);
+
+	return { toolResults: emittedToolResults, terminate };
 }
 
 /**

@@ -21,7 +21,7 @@ import type {
 } from "@oh-my-pi/pi-agent-core/types";
 import { ASIDE_MESSAGE_COMMIT, ASIDE_MESSAGE_DISCARD, SPECULATIVE_STREAM_SESSION } from "@oh-my-pi/pi-agent-core/types";
 import type { AssistantMessage, AssistantMessageEvent, Context, Message, ToolResultMessage } from "@oh-my-pi/pi-ai";
-import { createMockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
+import { createMockModel, type MockModel, type MockResponse } from "@oh-my-pi/pi-ai/providers/mock";
 import { kCursorExecResolved, setStreamingPartialJson } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
@@ -4725,6 +4725,640 @@ describe("agentLoop useless-flag propagation", () => {
 		});
 		expect(message.isError).toBe(true);
 		expect(message.useless).toBeUndefined();
+	});
+});
+
+describe("agentLoop tool batch admission", () => {
+	const toolSchema = type({ value: "string?" });
+	type ToolCallSpec = { type: "toolCall"; id: string; name: string; arguments: Record<string, unknown> };
+	interface BatchRun {
+		events: AgentEvent[];
+		executed: string[];
+		mock: MockModel;
+	}
+
+	/** Drive one turn whose batch is `calls`, then a plain text turn. */
+	async function runBatch(
+		calls: ToolCallSpec[],
+		beforeToolCall?: AgentLoopConfig["beforeToolCall"],
+	): Promise<BatchRun> {
+		const executed: string[] = [];
+		const sideEffect: AgentTool<typeof toolSchema, { value?: string }> = {
+			name: "side_effect",
+			label: "Side effect",
+			description: "Records that it ran",
+			parameters: toolSchema,
+			async execute(_toolCallId, params) {
+				executed.push("side_effect");
+				return { content: [{ type: "text", text: `side_effect:${params.value ?? ""}` }], details: {} };
+			},
+		};
+		const submit: AgentTool<typeof toolSchema, { value?: string }> = {
+			name: "submit",
+			label: "Submit",
+			description: "Declares that it must be the only call of its batch",
+			parameters: toolSchema,
+			batchPolicy: "sole",
+			async execute(_toolCallId, params) {
+				executed.push("submit");
+				return { content: [{ type: "text", text: `submit:${params.value ?? ""}` }], details: {} };
+			},
+		};
+		const context: AgentContext = {
+			systemPrompt: ["You are helpful."],
+			messages: [],
+			tools: [sideEffect, submit],
+		};
+		const mock = createMockModel({
+			responses: [{ content: calls }, { content: ["continued"] }],
+		});
+		const events: AgentEvent[] = [];
+		const stream = agentLoop(
+			[createUserMessage("go")],
+			context,
+			{ model: mock.model, convertToLlm: identityConverter, beforeToolCall },
+			undefined,
+			mock.stream,
+		);
+		for await (const event of stream) events.push(event);
+		return { events, executed, mock };
+	}
+
+	const soleCall: ToolCallSpec = { type: "toolCall", id: "sole-1", name: "submit", arguments: { value: "plan" } };
+	const sideCall: ToolCallSpec = {
+		type: "toolCall",
+		id: "side-1",
+		name: "side_effect",
+		arguments: { value: "touch" },
+	};
+	const secondSoleCall: ToolCallSpec = {
+		type: "toolCall",
+		id: "sole-2",
+		name: "submit",
+		arguments: { value: "again" },
+	};
+	const unknownCall: ToolCallSpec = { type: "toolCall", id: "ghost-1", name: "ghost_tool", arguments: {} };
+	const invalidCall: ToolCallSpec = { type: "toolCall", id: "side-2", name: "side_effect", arguments: { value: 7 } };
+
+	it("runs a sole-batch tool that is the only call in its assistant message", async () => {
+		const { events, executed, mock } = await runBatch([soleCall]);
+
+		expect(executed).toEqual(["submit"]);
+		const starts = events.filter(e => e.type === "tool_execution_start");
+		expect(starts.map(e => e.toolCallId)).toEqual(["sole-1"]);
+		const toolEnd = events.find(e => e.type === "tool_execution_end");
+		expect(toolEnd?.isError).toBe(false);
+		// A lone call is admitted and the loop moves on to the next model turn.
+		expect(mock.calls).toHaveLength(2);
+	});
+
+	// Every order and every kind of sibling: the rule is declared by the tool,
+	// and a violating batch is rejected whole — nothing in it runs.
+	const rejectedBatches: Array<{ label: string; calls: ToolCallSpec[] }> = [
+		{ label: "[sideEffect, sole]", calls: [sideCall, soleCall] },
+		{ label: "[sole, sideEffect]", calls: [soleCall, sideCall] },
+		{ label: "[sole, sole]", calls: [soleCall, secondSoleCall] },
+		{ label: "[unknown, sole]", calls: [unknownCall, soleCall] },
+		{ label: "[invalidArgs, sole]", calls: [invalidCall, soleCall] },
+	];
+
+	for (const batch of rejectedBatches) {
+		it(`rejects every call of a batch that shares its message with a sole-batch tool ${batch.label}`, async () => {
+			const { events, executed, mock } = await runBatch(batch.calls);
+
+			expect(executed).toEqual([]);
+			// Nothing started: not the sole call, not its siblings — and no
+			// execution-start event claims otherwise.
+			expect(events.filter(e => e.type === "tool_execution_start")).toEqual([]);
+			const results = events
+				.filter((e): e is Extract<AgentEvent, { type: "message_end" }> => e.type === "message_end")
+				.map(e => e.message)
+				.filter((message): message is ToolResultMessage => message.role === "toolResult");
+			// One blocked result per call, in call order, so the provider still
+			// gets a well-formed pairing for each tool_use block.
+			expect(results.map(message => message.toolCallId)).toEqual(batch.calls.map(call => call.id));
+			expect(results.every(message => message.isError === true)).toBe(true);
+			for (const message of results) {
+				const text = message.content.map(block => (block.type === "text" ? block.text : "")).join("\n");
+				expect(text).toBe("submit must be the only tool call in the assistant message.");
+			}
+			// The blocked batch does not end the turn: the model sees the
+			// rejections and answers again.
+			expect(mock.calls).toHaveLength(2);
+		});
+	}
+
+	it("never consults the pre-dispatch hook for a rejected batch", async () => {
+		const hookCalls: string[] = [];
+		const rejected = await runBatch([sideCall, soleCall], context => {
+			hookCalls.push(context.toolCall.name);
+			return undefined;
+		});
+
+		// Admission is a property of the message: no per-call hook (approval,
+		// extension policy) runs for a batch that can never execute, so a host
+		// cannot prompt for a call the loop has already refused.
+		expect(hookCalls).toEqual([]);
+		expect(rejected.executed).toEqual([]);
+
+		const admittedCalls: string[] = [];
+		await runBatch([soleCall], context => {
+			admittedCalls.push(context.toolCall.name);
+			return undefined;
+		});
+		expect(admittedCalls).toEqual(["submit"]);
+	});
+
+	it("keeps the default shared scheduling and serializes an explicit exclusive call", async () => {
+		const order: string[] = [];
+		const slowStarted = Promise.withResolvers<void>();
+		const releaseSlow = Promise.withResolvers<void>();
+		let slowFinished = false;
+		let fastRanWhileSlowPending = false;
+		let exclusiveSawSlowFinished = false;
+
+		const slow: AgentTool<typeof toolSchema, { value?: string }> = {
+			name: "slow",
+			label: "Slow",
+			description: "Shared slow call",
+			parameters: toolSchema,
+			async execute() {
+				order.push("slow:start");
+				slowStarted.resolve();
+				await releaseSlow.promise;
+				slowFinished = true;
+				order.push("slow:end");
+				return { content: [{ type: "text", text: "slow" }], details: {} };
+			},
+		};
+		const fast: AgentTool<typeof toolSchema, { value?: string }> = {
+			name: "fast",
+			label: "Fast",
+			description: "Shared fast call",
+			parameters: toolSchema,
+			async execute() {
+				await slowStarted.promise;
+				fastRanWhileSlowPending = !slowFinished;
+				order.push("fast");
+				return { content: [{ type: "text", text: "fast" }], details: {} };
+			},
+		};
+		const exclusive: AgentTool<typeof toolSchema, { value?: string }> = {
+			name: "exclusive",
+			label: "Exclusive",
+			description: "Runs alone",
+			parameters: toolSchema,
+			concurrency: "exclusive",
+			async execute() {
+				exclusiveSawSlowFinished = slowFinished;
+				order.push("exclusive");
+				return { content: [{ type: "text", text: "exclusive" }], details: {} };
+			},
+		};
+
+		const context: AgentContext = {
+			systemPrompt: ["You are helpful."],
+			messages: [],
+			tools: [slow, fast, exclusive],
+		};
+		const mock = createMockModel({
+			responses: [
+				{
+					content: [
+						{ type: "toolCall", id: "slow-1", name: "slow", arguments: {} },
+						{ type: "toolCall", id: "fast-1", name: "fast", arguments: {} },
+						{ type: "toolCall", id: "exclusive-1", name: "exclusive", arguments: {} },
+					],
+				},
+				{ content: ["done"] },
+			],
+		});
+		const events: AgentEvent[] = [];
+		const stream = agentLoop(
+			[createUserMessage("go")],
+			context,
+			{ model: mock.model, convertToLlm: identityConverter },
+			undefined,
+			mock.stream,
+		);
+		const drained = (async () => {
+			for await (const event of stream) {
+				events.push(event);
+				// Release the shared pair once both have proven they overlap.
+				if (order.includes("fast")) releaseSlow.resolve();
+			}
+		})();
+		await drained;
+
+		// Default (omitted) concurrency is still "shared": the fast call ran
+		// while the slow one was still pending.
+		expect(fastRanWhileSlowPending).toBe(true);
+		// Explicit "exclusive" waited for the shared calls to finish.
+		expect(exclusiveSawSlowFinished).toBe(true);
+		expect(order).toEqual(["slow:start", "fast", "slow:end", "exclusive"]);
+	});
+});
+
+describe("agentLoop tool result termination", () => {
+	const toolSchema = type({ value: "string?" });
+
+	/** One terminating tool call, then a turn that must not be reached. */
+	async function runTerminatingBatch(options: {
+		result: { isError?: boolean; terminate?: boolean; streamTerminate?: boolean };
+		afterToolCall?: AgentLoopConfig["afterToolCall"];
+	}): Promise<{
+		events: AgentEvent[];
+		executed: string[];
+		mock: MockModel;
+		turnEndCalls: Array<{ willContinue: boolean | undefined; signalAborted: boolean }>;
+	}> {
+		const executed: string[] = [];
+		const tool: AgentTool<typeof toolSchema, { value?: string }> = {
+			name: "submit",
+			label: "Submit",
+			description: "Submit tool",
+			parameters: toolSchema,
+			async execute(_toolCallId, params, _signal, onUpdate) {
+				executed.push("submit");
+				if (options.result.streamTerminate) {
+					onUpdate?.({ content: [{ type: "text", text: "progress" }], terminate: true });
+				}
+				return {
+					content: [{ type: "text", text: `submitted:${params.value ?? ""}` }],
+					details: {},
+					isError: options.result.isError,
+					terminate: options.result.terminate,
+				};
+			},
+		};
+		const after: AgentTool<typeof toolSchema, { value?: string }> = {
+			name: "after",
+			label: "After",
+			description: "Runs after the batch",
+			parameters: toolSchema,
+			async execute() {
+				executed.push("after");
+				return { content: [{ type: "text", text: "after" }], details: {} };
+			},
+		};
+		const context: AgentContext = {
+			systemPrompt: ["You are helpful."],
+			messages: [],
+			tools: [tool, after],
+		};
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id: "submit-1", name: "submit", arguments: { value: "x" } }] },
+				{ content: [{ type: "toolCall", id: "after-1", name: "after", arguments: {} }] },
+				{ content: ["done"] },
+			],
+		});
+		const events: AgentEvent[] = [];
+		const turnEndCalls: Array<{ willContinue: boolean | undefined; signalAborted: boolean }> = [];
+		const stream = agentLoop(
+			[createUserMessage("go")],
+			context,
+			{
+				model: mock.model,
+				convertToLlm: identityConverter,
+				afterToolCall: options.afterToolCall,
+				onTurnEnd: (_messages, signal, ctx) => {
+					turnEndCalls.push({ willContinue: ctx?.willContinue, signalAborted: signal?.aborted === true });
+				},
+			},
+			undefined,
+			mock.stream,
+		);
+		for await (const event of stream) events.push(event);
+		return { events, executed, mock, turnEndCalls };
+	}
+
+	it("ends the run after a successful tool result that requests termination", async () => {
+		const { events, executed, mock, turnEndCalls } = await runTerminatingBatch({ result: { terminate: true } });
+
+		expect(executed).toEqual(["submit"]);
+		// No further provider request and no further tool execution.
+		expect(mock.calls).toHaveLength(1);
+		const toolEnd = events.find(e => e.type === "tool_execution_end");
+		expect(toolEnd?.result.terminate).toBe(true);
+		expect(toolEnd?.isError).toBe(false);
+		// The turn closes as a completed one: willContinue false, no abort signal.
+		expect(turnEndCalls).toEqual([{ willContinue: false, signalAborted: false }]);
+		// Termination is not an abort: the turn keeps its own stop reason.
+		const assistantEnds = events
+			.filter((e): e is Extract<AgentEvent, { type: "message_end" }> => e.type === "message_end")
+			.map(e => e.message)
+			.filter((message): message is AssistantMessage => message.role === "assistant");
+		expect(assistantEnds.map(message => message.stopReason)).toEqual(["toolUse"]);
+	});
+
+	it("ends the run after a failed tool result that requests termination", async () => {
+		const { events, executed, mock, turnEndCalls } = await runTerminatingBatch({
+			result: { isError: true, terminate: true },
+		});
+
+		expect(executed).toEqual(["submit"]);
+		expect(mock.calls).toHaveLength(1);
+		const toolEnd = events.find(e => e.type === "tool_execution_end");
+		expect(toolEnd?.isError).toBe(true);
+		expect(toolEnd?.result.terminate).toBe(true);
+		expect(turnEndCalls).toEqual([{ willContinue: false, signalAborted: false }]);
+		const assistantEnds = events
+			.filter((e): e is Extract<AgentEvent, { type: "message_end" }> => e.type === "message_end")
+			.map(e => e.message)
+			.filter((message): message is AssistantMessage => message.role === "assistant");
+		expect(assistantEnds.every(message => message.stopReason !== "aborted")).toBe(true);
+	});
+
+	it("keeps running when the tool result carries no termination request", async () => {
+		const { events, executed, mock } = await runTerminatingBatch({ result: {} });
+
+		expect(executed).toEqual(["submit", "after"]);
+		expect(mock.calls).toHaveLength(3);
+		expect(events.find(e => e.type === "tool_execution_end")?.result.terminate).toBeUndefined();
+	});
+
+	it("lets afterToolCall request termination and override a tool's request", async () => {
+		const requested = await runTerminatingBatch({
+			result: {},
+			afterToolCall: async () => ({ terminate: true }),
+		});
+		expect(requested.mock.calls).toHaveLength(1);
+		expect(requested.events.find(e => e.type === "tool_execution_end")?.result.terminate).toBe(true);
+
+		const overridden = await runTerminatingBatch({
+			result: { terminate: true },
+			afterToolCall: async () => ({ terminate: false }),
+		});
+		expect(overridden.executed).toEqual(["submit", "after"]);
+		expect(overridden.mock.calls).toHaveLength(3);
+		expect(overridden.events.find(e => e.type === "tool_execution_end")?.result.terminate).toBeUndefined();
+	});
+
+	it("ignores terminate on a streaming partial update", async () => {
+		const { events, executed, mock } = await runTerminatingBatch({
+			result: { streamTerminate: true },
+		});
+
+		// The partial is delivered without the flag and the settled result — the
+		// only thing that can terminate — keeps the run going.
+		const update = events.find(
+			(e): e is Extract<AgentEvent, { type: "tool_execution_update" }> => e.type === "tool_execution_update",
+		);
+		expect(update?.partialResult.terminate).toBeUndefined();
+		expect(executed).toEqual(["submit", "after"]);
+		expect(mock.calls).toHaveLength(3);
+	});
+});
+
+describe("agentLoop sole-batch admission over every tool-call path", () => {
+	const toolSchema = type({ value: "string?" });
+
+	/**
+	 * Two provider turns: the batch under test, then a plain text turn. Every
+	 * block that is not stamped with `kCursorExecResolved` streams its tool calls
+	 * through `toolcall_end` (that event is what admits speculation), while a
+	 * Cursor-resolved block only appears in the final message — exactly like the
+	 * exec channel, which executes it and buffers the result out of band.
+	 */
+	function twoTurnStream(makeBlocks: () => AssistantMessage["content"]) {
+		let turn = 0;
+		return () => {
+			const response = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				if (turn++ === 0) {
+					const blocks = makeBlocks();
+					const streaming = createAssistantMessage(blocks, "toolUse");
+					response.push({ type: "start", partial: streaming });
+					const streamed = blocks.filter(
+						(block): block is Extract<AssistantMessage["content"][number], { type: "toolCall" }> =>
+							block.type === "toolCall" && !(kCursorExecResolved in (block as object)),
+					);
+					streamed.forEach((call, index) => {
+						response.push({
+							type: "toolcall_start",
+							contentIndex: index,
+							partial: streaming,
+						});
+						response.push({
+							type: "toolcall_delta",
+							contentIndex: index,
+							delta: JSON.stringify(call.arguments ?? {}),
+							partial: streaming,
+						});
+						response.push({
+							type: "toolcall_end",
+							contentIndex: index,
+							toolCall: call,
+							partial: streaming,
+						});
+					});
+					const done = createAssistantMessage(blocks, "toolUse");
+					response.push({ type: "done", reason: "toolUse", message: done });
+					return;
+				}
+				const textTurn = createAssistantMessage([{ type: "text", text: "done" }], "stop");
+				response.push({ type: "start", partial: textTurn });
+				response.push({ type: "done", reason: "stop", message: textTurn });
+			});
+			return response;
+		};
+	}
+
+	it("counts a Cursor exec-resolved sibling toward the batch and still blocks the sole call", async () => {
+		const executed: string[] = [];
+		const submit: AgentTool<typeof toolSchema, { value?: string }> = {
+			name: "submit",
+			label: "Submit",
+			description: "Declares that it must be the only call of its batch",
+			parameters: toolSchema,
+			batchPolicy: "sole",
+			async execute() {
+				executed.push("submit");
+				return { content: [{ type: "text", text: "submitted" }], details: {} };
+			},
+		};
+		const bash: AgentTool<typeof toolSchema, { value?: string }> = {
+			name: "bash",
+			label: "Bash",
+			description: "Runs a shell command locally",
+			parameters: toolSchema,
+			async execute() {
+				executed.push("bash");
+				return { content: [{ type: "text", text: "ran" }], details: {} };
+			},
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [submit, bash] };
+		const config: AgentLoopConfig = {
+			model: createMockModel().model,
+			convertToLlm: identityConverter,
+		};
+
+		// The Cursor exec channel already ran `bash` server-side and stamped the
+		// block with `kCursorExecResolved`; the loop must therefore count it as a
+		// sibling (PI counts every `toolCall` block of the assistant message)
+		// instead of treating the batch as a lone sole call.
+		let batchBlocks: AssistantMessage["content"] = [];
+		const streamFn = twoTurnStream(() => {
+			batchBlocks = [
+				{
+					type: "toolCall",
+					id: "cursor-bash-1",
+					name: "bash",
+					arguments: { value: "rm -rf /tmp/cursor-sibling" },
+					[kCursorExecResolved]: true as const,
+				},
+				{ type: "toolCall", id: "submit-1", name: "submit", arguments: { value: "plan" } },
+			] as AssistantMessage["content"];
+			return batchBlocks;
+		});
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([createUserMessage("go")], context, config, undefined, streamFn);
+		for await (const event of stream) events.push(event);
+
+		// Nothing the loop dispatches ran, and nothing started.
+		expect(executed).toEqual([]);
+		expect(events.filter(event => event.type === "tool_execution_start")).toEqual([]);
+		// The sole call is answered with the blocked result, in batch order.
+		const results = events
+			.filter((event): event is Extract<AgentEvent, { type: "message_end" }> => event.type === "message_end")
+			.map(event => event.message)
+			.filter((message): message is ToolResultMessage => message.role === "toolResult");
+		expect(results.map(message => message.toolCallId)).toEqual(["submit-1"]);
+		expect(results[0]?.isError).toBe(true);
+		expect(JSON.stringify(results[0]?.content)).toContain("must be the only tool call in the assistant message");
+
+		// Recorded limit, not a pass: the exec-resolved sibling was already run by
+		// the provider/editor bridge before this assistant message existed, so
+		// "the whole batch had zero side effects" is NOT true for this path. The
+		// loop only guarantees it never dispatches a call of the rejected batch
+		// a second time — the marker asserted here is exactly what prevents that
+		// duplicate side effect, and nothing the loop does can retract the
+		// execution that already happened.
+		const cursorBlock = batchBlocks[0] as { [kCursorExecResolved]?: true };
+		expect(cursorBlock[kCursorExecResolved]).toBe(true);
+	});
+
+	for (const order of ["speculative-first", "sole-first"] as const) {
+		it(`does not start a speculative candidate when the batch advertises a sole-batch tool (${order})`, async () => {
+			const speculativeExecutions: string[] = [];
+			const ordinaryExecutions: string[] = [];
+			const shadow: AgentTool<typeof toolSchema, { value?: string }> = {
+				name: "shadow",
+				label: "Shadow",
+				description: "Speculates a pure result while streaming",
+				parameters: toolSchema,
+				speculation: {
+					finalized: {
+						assess: () => ({ eligible: true, effect: { kind: "pure" as const } }),
+						async execute() {
+							speculativeExecutions.push("shadow");
+							return {
+								kind: "result" as const,
+								result: { content: [{ type: "text", text: "shadow" }] },
+								isError: false,
+							};
+						},
+					},
+				},
+				async execute() {
+					ordinaryExecutions.push("shadow");
+					return { content: [{ type: "text", text: "shadow" }], details: {} };
+				},
+			};
+			const submit: AgentTool<typeof toolSchema, { value?: string }> = {
+				name: "submit",
+				label: "Submit",
+				description: "Declares that it must be the only call of its batch",
+				parameters: toolSchema,
+				batchPolicy: "sole",
+				async execute() {
+					ordinaryExecutions.push("submit");
+					return { content: [{ type: "text", text: "submitted" }], details: {} };
+				},
+			};
+			const shadowCall = { type: "toolCall" as const, id: "shadow-1", name: "shadow", arguments: { value: "x" } };
+			const submitCall = { type: "toolCall" as const, id: "submit-1", name: "submit", arguments: { value: "plan" } };
+			const context: AgentContext = { systemPrompt: [""], messages: [], tools: [shadow, submit] };
+			const config: AgentLoopConfig = {
+				model: createMockModel().model,
+				convertToLlm: identityConverter,
+				getToolContext: () => ({}),
+				speculativeToolExecution: { enabled: true },
+			};
+			const streamFn = twoTurnStream(
+				() =>
+					(order === "speculative-first"
+						? [shadowCall, submitCall]
+						: [submitCall, shadowCall]) as AssistantMessage["content"],
+			);
+
+			const events: AgentEvent[] = [];
+			const stream = agentLoop([createUserMessage("go")], context, config, undefined, streamFn);
+			for await (const event of stream) events.push(event);
+
+			// A rejecting batch must not have speculative physical work started
+			// before its admission is decided.
+			expect(speculativeExecutions).toEqual([]);
+			expect(ordinaryExecutions).toEqual([]);
+			expect(events.filter(event => event.type === "tool_execution_start")).toEqual([]);
+			const results = events
+				.filter((event): event is Extract<AgentEvent, { type: "message_end" }> => event.type === "message_end")
+				.map(event => event.message)
+				.filter((message): message is ToolResultMessage => message.role === "toolResult");
+			expect(results.map(message => message.toolCallId)).toEqual(
+				(order === "speculative-first" ? [shadowCall, submitCall] : [submitCall, shadowCall]).map(call => call.id),
+			);
+			expect(results.every(message => message.isError === true)).toBe(true);
+		});
+	}
+
+	it("keeps speculation working when no sole-batch tool is advertised (control)", async () => {
+		const speculativeExecutions: string[] = [];
+		const shadow: AgentTool<typeof toolSchema, { value?: string }> = {
+			name: "shadow",
+			label: "Shadow",
+			description: "Speculates a pure result while streaming",
+			parameters: toolSchema,
+			speculation: {
+				finalized: {
+					assess: () => ({ eligible: true, effect: { kind: "pure" as const } }),
+					async execute() {
+						speculativeExecutions.push("shadow");
+						return {
+							kind: "result" as const,
+							result: { content: [{ type: "text", text: "shadow" }] },
+							isError: false,
+						};
+					},
+				},
+			},
+			async execute() {
+				throw new Error("ordinary execution must not run when the candidate commits");
+			},
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [shadow] };
+		const config: AgentLoopConfig = {
+			model: createMockModel().model,
+			convertToLlm: identityConverter,
+			getToolContext: () => ({}),
+			speculativeToolExecution: { enabled: true },
+		};
+		const streamFn = twoTurnStream(
+			() =>
+				[
+					{ type: "toolCall", id: "shadow-1", name: "shadow", arguments: { value: "x" } },
+				] as AssistantMessage["content"],
+		);
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([createUserMessage("go")], context, config, undefined, streamFn);
+		for await (const event of stream) events.push(event);
+
+		expect(speculativeExecutions).toEqual(["shadow"]);
+		const toolEnd = events.find(event => event.type === "tool_execution_end");
+		expect(toolEnd?.isError).toBe(false);
 	});
 });
 

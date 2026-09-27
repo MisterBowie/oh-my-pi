@@ -1010,6 +1010,8 @@ export class RpcClient {
 			hidden: tool.hidden,
 			loadMode: tool.loadMode,
 			readsSkillUris: tool.readsSkillUris,
+			concurrency: tool.concurrency,
+			batchPolicy: tool.batchPolicy,
 		}));
 		const response = await this.#send({ type: "set_host_tools", tools: definitions });
 		return this.#getData<{ toolNames: string[] }>(response).toolNames;

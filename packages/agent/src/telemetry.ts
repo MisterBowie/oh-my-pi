@@ -1909,7 +1909,7 @@ export function recordSkippedTool(
 	options: {
 		readonly toolCallId: string;
 		readonly toolName: string;
-		readonly status: Extract<ToolStatus, "skipped" | "aborted" | "error">;
+		readonly status: Extract<ToolStatus, "skipped" | "aborted" | "error" | "blocked">;
 	},
 ): void {
 	telemetry?.collector.recordOrphanTool(options);

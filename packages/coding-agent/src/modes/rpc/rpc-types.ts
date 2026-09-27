@@ -471,6 +471,23 @@ export interface RpcHostToolDefinition {
 	hidden?: boolean;
 	/** How this host tool is presented when enabled; omission normalizes to `"discoverable"` at the adapter boundary. */
 	loadMode?: ToolLoadMode;
+	/**
+	 * Scheduling mode for this host tool when several calls share one turn:
+	 * `"shared"` (default) runs alongside other shared calls, `"exclusive"`
+	 * waits for them and holds later calls back until it finishes. Any other
+	 * value rejects the whole `set_host_tools` request — an unrecognized
+	 * declaration never degrades to the default.
+	 */
+	concurrency?: "shared" | "exclusive";
+	/**
+	 * Batch admission rule for this host tool: `"any"` (default) lets the call
+	 * share its assistant message, `"sole"` requires it to be the only tool call
+	 * in that message. A batch that carries a `"sole"` tool and any sibling is
+	 * rejected whole before scheduling: no call in it executes, no
+	 * `tool_execution_start` is emitted, and every call is answered with a
+	 * blocked error result. Any other value rejects the whole request.
+	 */
+	batchPolicy?: "any" | "sole";
 	/** Whether this host tool can read `skill://` instruction content. */
 	readsSkillUris?: boolean;
 }
@@ -502,7 +519,19 @@ export interface RpcHostToolUpdate {
 export interface RpcHostToolResult {
 	type: "host_tool_result";
 	id: string;
+	/**
+	 * Settled result. Carried into the agent loop as-is, so `result.terminate:
+	 * true` ends the agent run once the batch settles (success and error results
+	 * alike) instead of requesting another model turn. A `host_tool_update`
+	 * partial can never terminate.
+	 */
 	result: AgentToolResult<unknown>;
+	/**
+	 * Rejects the pending call and surfaces the result's text as a tool error —
+	 * unless the result also requests `terminate`, in which case it is delivered
+	 * as a settled error result so the flag survives; the loop then reads
+	 * `isError = frame.isError || result.isError`.
+	 */
 	isError?: boolean;
 }
 

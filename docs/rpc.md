@@ -445,6 +445,23 @@ Definitions also accept `hidden?: boolean` and
 known essential built-in names remain `"essential"`; other host tools default
 to `"discoverable"`. `toolNames` in the response lists the registered names.
 
+Two optional scheduling declarations are forwarded to the agent scheduler:
+
+- `concurrency?: "shared" | "exclusive"` — `"shared"` (default) may run
+  alongside other shared calls in the same turn; `"exclusive"` waits for them
+  and holds later calls back until it finishes.
+- `batchPolicy?: "any" | "sole"` — `"any"` (default) lets the call share its
+  assistant message. `"sole"` requires it to be the ONLY tool call in that
+  message: a batch that carries a `"sole"` tool and any sibling is rejected
+  whole before scheduling, so no call in it executes, no
+  `tool_execution_start` is emitted, and every call of the batch is answered
+  with a blocked error result.
+
+An unrecognized value for either field rejects the whole `set_host_tools`
+request with an error response; it never degrades to the default. Only an
+*omitted* field takes the default: JSON `null` is a declared value and is
+rejected like any other unrecognized one.
+
 ### `set_host_uri_schemes` payload
 
 Replaces the current set of host-owned URL schemes the RPC server should
@@ -729,6 +746,31 @@ Completion uses:
 ```
 
 Set top-level `isError: true` on `host_tool_result` to reject the pending host tool call and surface the returned text content as a tool error.
+
+A settled result may also request termination:
+
+```json
+{
+  "type": "host_tool_result",
+  "id": "host_1",
+  "result": {
+    "content": [{ "type": "text", "text": "submitted" }],
+    "terminate": true
+  }
+}
+```
+
+`result.terminate` must be a JSON boolean or absent; any other value (for
+example the string `"false"`) fails the call instead of being read for
+truthiness. `result.terminate: true` ends the agent run once the current tool
+batch settles: the loop appends every result and stops before the next model
+call. This is a normal completion, not an abort — the turn keeps its own stop
+reason, and queued steering stays queued for the next run. Error results
+terminate the same way: a frame that sets both `isError` and
+`result.terminate` resolves with `isError: true, terminate: true` instead of
+being rejected, because a thrown error cannot carry the flag. A
+`host_tool_update` partial never terminates, even if its `partialResult`
+carries the field.
 
 ## Host URI Sub-Protocol
 

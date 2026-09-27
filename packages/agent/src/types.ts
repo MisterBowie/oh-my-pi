@@ -841,6 +841,8 @@ export interface AfterToolCallResult {
 	isError?: boolean;
 	/** If provided, replaces the contextually-useless flag carried with the tool result. */
 	useless?: boolean;
+	/** If provided, replaces the terminate request carried with the tool result. See {@link AgentToolResult.terminate}. */
+	terminate?: boolean;
 }
 
 /** Context passed to `beforeToolCall`. */
@@ -930,6 +932,20 @@ export interface AgentToolResult<T = any, _TInput = unknown> {
 	providerMetadata?: ToolResultProviderMetadata;
 	/** Marks the result as contextually useless: safe for compaction to elide once consumed (e.g. zero matches, wait timeout). Ignored when isError is set. */
 	useless?: boolean;
+	/**
+	 * Requests that the agent run ends once the current tool batch settles.
+	 *
+	 * The loop still finishes the batch and appends every result, then stops
+	 * before the next provider call. This is a normal termination, not an
+	 * abort: no `stopReason` is rewritten to `"aborted"`, queued steering is
+	 * left for the next run, and a batch only needs one result carrying the
+	 * flag. Error results terminate exactly like successful ones.
+	 *
+	 * Only a settled result terminates. A streaming partial
+	 * (`tool_execution_update`) may carry the flag and is ignored, so a tool
+	 * that streams progress cannot end the run before it returns.
+	 */
+	terminate?: boolean;
 }
 
 // Callback for streaming tool execution updates
@@ -1055,6 +1071,20 @@ export interface AgentTool<
 	 * - function: resolved per call from the (raw, pre-validation) arguments
 	 */
 	concurrency?: "shared" | "exclusive" | ((args: Partial<Static<TParameters>>) => "shared" | "exclusive");
+
+	/**
+	 * Batch admission rule for the assistant message that requested the call.
+	 * - "any": the call may share its assistant message with other calls (default)
+	 * - "sole": the call must be the ONLY tool call in that message
+	 *
+	 * A batch that contains a `"sole"` call and any sibling is rejected whole
+	 * before scheduling: no call in it executes (the sole call, its siblings,
+	 * unknown names and invalid arguments alike), no `tool_execution_start` is
+	 * emitted, and every call of the batch is answered with a blocked error
+	 * result in call order. The rule is declared by the tool, never inferred
+	 * from its name.
+	 */
+	batchPolicy?: "any" | "sole";
 
 	/**
 	 * Declares the bounded, validated effect of a finalized call that may execute
