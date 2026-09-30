@@ -27,15 +27,18 @@ export interface CodingAgentCompileOptions {
 	/** Disable Bun's built-in Darwin signing before the caller re-signs. */
 	readonly skipBuiltinCodesign?: boolean;
 	/**
-	 * Precompile the bundle to bytecode (default `true`, the release behavior).
+	 * Precompile the bundle to bytecode (default `true`, the release behavior
+	 * and the `OMP Desktop` sidecar mode).
 	 *
 	 * Bytecode costs ~52 MB of binary size to skip parsing the bundle at boot.
-	 * It is also the only difference between two builds of the same source:
-	 * Bun 1.4.2 bakes build-local placeholders into the bytecode string table,
-	 * so a caller that needs one bit-identical artifact per source revision —
-	 * `OMP Desktop`'s bundled sidecar — passes `false` explicitly. The switch is
-	 * per-call and never reads the environment, so a stray variable cannot
-	 * change what a release build ships.
+	 * It is not what makes two builds of one source differ: same-input builds
+	 * are bit-identical with bytecode on and off once the embedded native-addon
+	 * archive is deterministic (`packages/natives/scripts/embed-native.ts`;
+	 * measured on Bun 1.4.2 at OMP Desktop's T20-R4-3). The switch is per-call
+	 * and never reads the environment, so the selected mode is explicit and
+	 * auditable, and a stray variable cannot change what a release build ships;
+	 * `false` is an explicit opt-out/control/diagnostic mode, not a prerequisite
+	 * for reproducible output.
 	 */
 	readonly bytecode?: boolean;
 }

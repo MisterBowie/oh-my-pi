@@ -51,8 +51,11 @@ export class BuildBinaryArgsError extends Error {
 /** Switches `build-binary.ts` accepts on the command line. */
 export interface BuildBinaryOptions {
 	/**
-	 * Embed precompiled bytecode; `--no-bytecode` turns it off for callers that
-	 * need two builds of one revision to be bit-identical (see
+	 * Embed precompiled bytecode (default `true`, the release behavior and the
+	 * `OMP Desktop` sidecar mode). `--no-bytecode` is an explicit
+	 * opt-out/control/diagnostic mode, and reproducibility does not require it:
+	 * the deterministic native-addon archive is what makes two builds of one
+	 * revision bit-identical, with bytecode either way (see
 	 * `CodingAgentCompileOptions.bytecode`).
 	 */
 	readonly bytecode: boolean;
