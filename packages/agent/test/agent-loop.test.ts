@@ -5111,6 +5111,263 @@ describe("agentLoop tool result termination", () => {
 	});
 });
 
+describe("agentLoop terminateOnSettle declaration", () => {
+	const toolSchema = type({ value: "string" });
+
+	/** A terminating tool plus a follow-up tool the run must not reach. */
+	function terminatingTool(overrides: Partial<AgentTool<typeof toolSchema, unknown>> = {}): AgentTool<typeof toolSchema, unknown> {
+		return {
+			name: "submit",
+			label: "Submit",
+			description: "Submit tool",
+			parameters: toolSchema,
+			terminateOnSettle: true,
+			async execute() {
+				return { content: [{ type: "text", text: "submitted" }], details: {} };
+			},
+			...overrides,
+		};
+	}
+
+	function followUpTool(executed: string[]): AgentTool<typeof toolSchema, unknown> {
+		return {
+			name: "after",
+			label: "After",
+			description: "Runs after the batch",
+			parameters: toolSchema,
+			async execute() {
+				executed.push("after");
+				return { content: [{ type: "text", text: "after" }], details: {} };
+			},
+		};
+	}
+
+	async function run(options: {
+		tool: AgentTool<typeof toolSchema, unknown>;
+		tools?: AgentTool<any, any>[];
+		arguments?: Record<string, unknown>;
+		config?: Partial<AgentLoopConfig>;
+	}): Promise<{ events: AgentEvent[]; executed: string[]; mock: MockModel }> {
+		const executed: string[] = [];
+		const context: AgentContext = {
+			systemPrompt: ["You are helpful."],
+			messages: [],
+			tools: options.tools ?? [options.tool, followUpTool(executed)],
+		};
+		const mock = createMockModel({
+			responses: [
+				{
+					content: [
+						{
+							type: "toolCall",
+							id: "submit-1",
+							name: options.tool.name,
+							arguments: options.arguments ?? { value: "x" },
+						},
+					],
+				},
+				{ content: [{ type: "toolCall", id: "after-1", name: "after", arguments: { value: "a" } }] },
+				{ content: ["done"] },
+			],
+		});
+		const events: AgentEvent[] = [];
+		const stream = agentLoop(
+			[createUserMessage("go")],
+			context,
+			{ model: mock.model, convertToLlm: identityConverter, ...options.config },
+			undefined,
+			mock.stream,
+		);
+		for await (const event of stream) events.push(event);
+		return { events, executed, mock };
+	}
+
+	it("terminates on a schema-validation rejection that never reaches execute", async () => {
+		const executed: string[] = [];
+		const tool = terminatingTool({
+			async execute() {
+				executed.push("submit");
+				return { content: [{ type: "text", text: "submitted" }], details: {} };
+			},
+		});
+		// `value` is required; the model omitted it. (A wrong-typed value would
+		// be repaired by the validator's coercion passes, exactly like the
+		// pinned runtime repairs a number into a string.)
+		const { events, mock } = await run({ tool, arguments: {} });
+
+		expect(executed).toEqual([]);
+		expect(mock.calls).toHaveLength(1);
+		const toolEnd = events.find(e => e.type === "tool_execution_end");
+		expect(toolEnd?.isError).toBe(true);
+		expect(toolEnd?.result.terminate).toBe(true);
+		expect(JSON.stringify(toolEnd?.result.content)).toContain("Validation failed");
+	});
+
+	it("terminates when execute throws", async () => {
+		const tool = terminatingTool({
+			async execute() {
+				throw new Error("submit backend exploded");
+			},
+		});
+		const { events, mock } = await run({ tool });
+
+		expect(mock.calls).toHaveLength(1);
+		const toolEnd = events.find(e => e.type === "tool_execution_end");
+		expect(toolEnd?.isError).toBe(true);
+		expect(toolEnd?.result.terminate).toBe(true);
+	});
+
+	it("terminates on a successful result that carries no flag of its own", async () => {
+		const { events, executed, mock } = await run({ tool: terminatingTool() });
+
+		// The follow-up tool never runs and no second provider call happens.
+		expect(executed).toEqual([]);
+		expect(mock.calls).toHaveLength(1);
+		expect(events.find(e => e.type === "tool_execution_end")?.result.terminate).toBe(true);
+	});
+
+	it("does not grant the declaration to an unknown tool that shares the name", async () => {
+		const executed: string[] = [];
+		const { mock, events } = await run({
+			tool: terminatingTool(),
+			// The registered tool is a different name: the call resolves to no
+			// definition, so the declaration is not inherited by the name.
+			tools: [followUpTool(executed)],
+		});
+
+		expect(mock.calls).toHaveLength(3);
+		expect(executed).toEqual(["after"]);
+		const toolEnd = events.find(e => e.type === "tool_execution_end");
+		expect(toolEnd?.isError).toBe(true);
+		expect(toolEnd?.result.terminate).toBeUndefined();
+	});
+
+	it("does not terminate when the call is skipped by queued steering", async () => {
+		const executed: string[] = [];
+		// A first call that actually runs (and is not terminating) keeps the
+		// batch occupied long enough for the steering poll to queue a message;
+		// the terminating call behind it is then skipped, never executed.
+		const gate: AgentTool<typeof toolSchema, unknown> = {
+			name: "gate",
+			label: "Gate",
+			description: "Runs first",
+			parameters: toolSchema,
+			concurrency: "exclusive",
+			interruptible: true,
+			async execute() {
+				executed.push("gate");
+				return { content: [{ type: "text", text: "gate" }], details: {} };
+			},
+		};
+		const tool = terminatingTool({
+			concurrency: "exclusive",
+			interruptible: true,
+			async execute() {
+				executed.push("submit");
+				return { content: [{ type: "text", text: "submitted" }], details: {} };
+			},
+		});
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [gate, tool] };
+		const mock = createMockModel({
+			responses: [
+				{
+					content: [
+						{ type: "toolCall", id: "gate-1", name: "gate", arguments: { value: "g" } },
+						{ type: "toolCall", id: "submit-1", name: "submit", arguments: { value: "x" } },
+					],
+				},
+				{ content: ["done"] },
+			],
+		});
+		let delivered = false;
+		const events: AgentEvent[] = [];
+		const stream = agentLoop(
+			[createUserMessage("start")],
+			context,
+			{
+				model: mock.model,
+				convertToLlm: identityConverter,
+				interruptMode: "immediate",
+				hasSteeringMessages: () => executed.length >= 1 && !delivered,
+				getSteeringMessages: async () => {
+					if (executed.length >= 1 && !delivered) {
+						delivered = true;
+						return [createUserMessage("interrupt")];
+					}
+					return [];
+				},
+			},
+			undefined,
+			mock.stream,
+		);
+		for await (const event of stream) events.push(event);
+
+		// The terminating call was skipped by the steer; its skip result must
+		// not end the run — the steering message is injected instead.
+		expect(executed).toEqual(["gate"]);
+		const skipped = events.find(
+			(e): e is Extract<AgentEvent, { type: "tool_execution_end" }> =>
+				e.type === "tool_execution_end" && e.toolCallId === "submit-1",
+		);
+		expect(skipped?.result.terminate).toBeUndefined();
+		expect(mock.calls.length).toBeGreaterThan(1);
+	});
+
+	it("keeps a sole-batch rejection non-terminating so the model can correct", async () => {
+		const executed: string[] = [];
+		const tool = terminatingTool({ batchPolicy: "sole", concurrency: "exclusive" });
+		const sibling: AgentTool<typeof toolSchema, unknown> = {
+			name: "after",
+			label: "After",
+			description: "Sibling",
+			parameters: toolSchema,
+			terminateOnSettle: true,
+			async execute() {
+				executed.push("after");
+				return { content: [{ type: "text", text: "after" }], details: {} };
+			},
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool, sibling] };
+		const mock = createMockModel({
+			responses: [
+				{
+					content: [
+						{ type: "toolCall", id: "submit-1", name: "submit", arguments: { value: "x" } },
+						{ type: "toolCall", id: "after-1", name: "after", arguments: { value: "a" } },
+					],
+				},
+				{ content: [{ type: "toolCall", id: "submit-2", name: "submit", arguments: { value: "x" } }] },
+				{ content: ["done"] },
+			],
+		});
+		const events: AgentEvent[] = [];
+		const stream = agentLoop(
+			[createUserMessage("go")],
+			context,
+			{ model: mock.model, convertToLlm: identityConverter },
+			undefined,
+			mock.stream,
+		);
+		for await (const event of stream) events.push(event);
+
+		// The whole batch was rejected (no side effect), the model corrected with
+		// a sole call, and only that second call terminated the run.
+		expect(executed).toEqual([]);
+		expect(mock.calls).toHaveLength(2);
+		const rejected = events.filter(
+			(e): e is Extract<AgentEvent, { type: "tool_execution_end" }> =>
+				e.type === "tool_execution_end" && e.toolCallId === "after-1",
+		);
+		expect(rejected).toHaveLength(1);
+		expect(rejected[0].result.terminate).toBeUndefined();
+		const soleEnd = events.find(
+			(e): e is Extract<AgentEvent, { type: "tool_execution_end" }> =>
+				e.type === "tool_execution_end" && e.toolCallId === "submit-2",
+		);
+		expect(soleEnd?.result.terminate).toBe(true);
+	});
+});
+
 describe("agentLoop sole-batch admission over every tool-call path", () => {
 	const toolSchema = type({ value: "string?" });
 

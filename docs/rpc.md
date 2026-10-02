@@ -457,10 +457,23 @@ Two optional scheduling declarations are forwarded to the agent scheduler:
   `tool_execution_start` is emitted, and every call of the batch is answered
   with a blocked error result.
 
-An unrecognized value for either field rejects the whole `set_host_tools`
-request with an error response; it never degrades to the default. Only an
-*omitted* field takes the default: JSON `null` is a declared value and is
-rejected like any other unrecognized one.
+One optional settlement declaration is forwarded to the agent loop:
+
+- `terminateOnSettle?: boolean` — `false` (default). If `true`, ANY settled
+  result of this tool ends the run once its batch settles: success, failure,
+  a schema-validation rejection that never reaches `execute`, a
+  `beforeToolCall` rejection or transform failure, and an execution throw all
+  terminate identically. The loop enforces the declaration at its single
+  settlement boundary, reading it from the resolved tool definition, so a
+  tool name can never acquire it. Skips and cancellations keep their own
+  semantics: a call rejected by batch admission, skipped by a pending
+  interrupt, or running under an externally aborted run does not terminate,
+  and a streaming partial can never terminate.
+
+An unrecognized value for any of these fields rejects the whole
+`set_host_tools` request with an error response; it never degrades to the
+default. Only an *omitted* field takes the default: JSON `null` is a declared
+value and is rejected like any other unrecognized one.
 
 ### `set_host_uri_schemes` payload
 

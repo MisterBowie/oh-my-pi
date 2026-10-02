@@ -3144,11 +3144,31 @@ async function executeToolCalls(
 	): void => {
 		if (record.resultEmitted) return;
 		const { toolCall } = record;
+		// A tool may declare that any settled result of its call ends the run
+		// (`AgentTool.terminateOnSettle`). Enforcing the declaration here — the
+		// single settlement boundary — covers every path that can produce a
+		// result: schema-validation rejection, pre-execution hook rejection or
+		// transform failure, execution throw, host error and success. The
+		// declaration is read from the RESOLVED tool, so an unknown name can
+		// never acquire it.
+		//
+		// Skips and cancellations keep their own semantics: a call rejected by
+		// batch admission, skipped by a pending interrupt, or running under an
+		// externally aborted run does not terminate — an interrupt is not a
+		// submission outcome, and a user Stop is a cancellation. A streaming
+		// partial never reaches this function.
+		const declaredTerminate =
+			record.tool?.terminateOnSettle === true &&
+			!record.skipped &&
+			!record.signal.aborted &&
+			signal?.aborted !== true;
+		const settled =
+			declaredTerminate && result.terminate !== true ? { ...result, terminate: true } : result;
 		stream.push({
 			type: "tool_execution_end",
 			toolCallId: toolCall.id,
 			toolName: toolCall.name,
-			result,
+			result: settled,
 			isError,
 		});
 
@@ -3156,14 +3176,14 @@ async function executeToolCalls(
 			role: "toolResult",
 			toolCallId: toolCall.id,
 			toolName: toolCall.name,
-			content: result.content,
-			details: result.details,
-			providerMetadata: result.providerMetadata,
+			content: settled.content,
+			details: settled.details,
+			providerMetadata: settled.providerMetadata,
 			isError,
-			...(result.useless && !isError ? { useless: true } : {}),
+			...(settled.useless && !isError ? { useless: true } : {}),
 			timestamp: Date.now(),
 		};
-		record.result = result;
+		record.result = settled;
 		record.isError = isError;
 		record.toolResultMessage = toolResultMessage;
 		record.resultEmitted = true;

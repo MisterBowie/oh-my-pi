@@ -73,8 +73,8 @@ export function isRpcHostToolUpdate(value: unknown): value is RpcHostToolUpdate 
  */
 export function normalizeHostToolPolicy(
 	name: string,
-	definition: Pick<RpcHostToolDefinition, "concurrency" | "batchPolicy">,
-): { concurrency: "shared" | "exclusive"; batchPolicy: "any" | "sole" } {
+	definition: Pick<RpcHostToolDefinition, "concurrency" | "batchPolicy" | "terminateOnSettle">,
+): { concurrency: "shared" | "exclusive"; batchPolicy: "any" | "sole"; terminateOnSettle: boolean } {
 	// Only an *omitted* field falls back to the documented default. JSON `null`
 	// is a declared value and fails closed like any other unrecognized one — a
 	// `??` here would silently accept `"concurrency": null` as `"shared"`.
@@ -90,7 +90,13 @@ export function normalizeHostToolPolicy(
 			`Host tool "${name}" declares an invalid batchPolicy ${JSON.stringify(definition.batchPolicy)}; expected "any" or "sole"`,
 		);
 	}
-	return { concurrency, batchPolicy };
+	const terminateOnSettle = definition.terminateOnSettle === undefined ? false : definition.terminateOnSettle;
+	if (typeof terminateOnSettle !== "boolean") {
+		throw new Error(
+			`Host tool "${name}" declares an invalid terminateOnSettle ${JSON.stringify(definition.terminateOnSettle)}; expected a boolean`,
+		);
+	}
+	return { concurrency, batchPolicy, terminateOnSettle };
 }
 
 class RpcHostToolAdapter<TParams extends TSchema = TSchema, TTheme extends Theme = Theme> implements AgentTool<
@@ -106,6 +112,8 @@ class RpcHostToolAdapter<TParams extends TSchema = TSchema, TTheme extends Theme
 	concurrency: "shared" | "exclusive" = "shared";
 	/** `"sole"` makes the call the only one allowed in its assistant message. */
 	batchPolicy: "any" | "sole" = "any";
+	/** `true` makes any settled result of this tool end the run. */
+	terminateOnSettle = false;
 	readonly loadMode: ToolLoadMode;
 	#bridge: RpcHostToolBridge;
 	#definition: RpcHostToolDefinition;
@@ -118,6 +126,7 @@ class RpcHostToolAdapter<TParams extends TSchema = TSchema, TTheme extends Theme
 		const policy = normalizeHostToolPolicy(definition.name, definition);
 		this.concurrency = policy.concurrency;
 		this.batchPolicy = policy.batchPolicy;
+		this.terminateOnSettle = policy.terminateOnSettle;
 	}
 
 	execute(

@@ -488,6 +488,15 @@ export interface RpcHostToolDefinition {
 	 * blocked error result. Any other value rejects the whole request.
 	 */
 	batchPolicy?: "any" | "sole";
+	/**
+	 * If true, any settled result of this host tool ends the agent run once its
+	 * batch settles — success, failure, schema-validation rejection and
+	 * pre-execution hook rejection alike. The declaration is enforced at the
+	 * loop's settlement boundary, so a validation failure that never reaches
+	 * the tool still terminates. Omission keeps the default (`false`); any
+	 * other value rejects the whole `set_host_tools` request.
+	 */
+	terminateOnSettle?: boolean;
 	/** Whether this host tool can read `skill://` instruction content. */
 	readsSkillUris?: boolean;
 }

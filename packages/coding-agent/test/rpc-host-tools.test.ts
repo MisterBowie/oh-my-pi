@@ -140,6 +140,7 @@ describe("RpcHostToolBridge", () => {
 				parameters: { type: "object", properties: {}, additionalProperties: false },
 				concurrency: "exclusive",
 				batchPolicy: "sole",
+				terminateOnSettle: true,
 			},
 			{
 				name: "host_echo",
@@ -151,9 +152,11 @@ describe("RpcHostToolBridge", () => {
 
 		expect(explicit?.concurrency).toBe("exclusive");
 		expect(explicit?.batchPolicy).toBe("sole");
+		expect(explicit?.terminateOnSettle).toBe(true);
 		// Omission keeps the documented defaults.
 		expect(defaults?.concurrency).toBe("shared");
 		expect(defaults?.batchPolicy).toBe("any");
+		expect(defaults?.terminateOnSettle).toBe(false);
 	});
 
 	it("rejects an illegal host tool policy instead of degrading to the default", () => {
@@ -169,6 +172,9 @@ describe("RpcHostToolBridge", () => {
 			/invalid concurrency/,
 		);
 		expect(() => bridge.setTools([{ ...definition, batchPolicy: "only" as "sole" }])).toThrow(/invalid batchPolicy/);
+		expect(() => bridge.setTools([{ ...definition, terminateOnSettle: "yes" as unknown as boolean }])).toThrow(
+			/invalid terminateOnSettle/,
+		);
 		// A refusal must not leave the bridge holding a half-registered set.
 		expect(bridge.getToolNames()).toEqual([]);
 		expect(bridge.setTools([definition])).toHaveLength(1);
@@ -227,11 +233,19 @@ describe("RpcHostToolBridge", () => {
 		expect(() => normalizeHostToolDefinitions([{ ...definition, batchPolicy: null as unknown as "sole" }])).toThrow(
 			/invalid batchPolicy/,
 		);
+		expect(() =>
+			normalizeHostToolDefinitions([{ ...definition, terminateOnSettle: null as unknown as boolean }]),
+		).toThrow(/invalid terminateOnSettle/);
 		// Omission still normalizes to the defaults.
 		const [normalized] = normalizeHostToolDefinitions([definition]);
-		expect({ concurrency: normalized?.concurrency, batchPolicy: normalized?.batchPolicy }).toEqual({
+		expect({
+			concurrency: normalized?.concurrency,
+			batchPolicy: normalized?.batchPolicy,
+			terminateOnSettle: normalized?.terminateOnSettle,
+		}).toEqual({
 			concurrency: "shared",
 			batchPolicy: "any",
+			terminateOnSettle: false,
 		});
 	});
 

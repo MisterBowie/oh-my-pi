@@ -1087,6 +1087,21 @@ export interface AgentTool<
 	batchPolicy?: "any" | "sole";
 
 	/**
+	 * If true, any settled result of this tool ends the agent run after its
+	 * batch settles — success, failure, argument-validation rejection and
+	 * pre-execution hook rejection alike. Equivalent to stamping
+	 * `terminate: true` on the result, but enforced at the loop's settlement
+	 * boundary, so every path (including a schema-validation failure that never
+	 * reaches `execute`) terminates identically.
+	 *
+	 * Skips and cancellations keep their own semantics: a call skipped by batch
+	 * admission, a pending interrupt or an external abort does not terminate,
+	 * and a streaming partial can never terminate. Only the resolved tool
+	 * definition grants this, never a tool name.
+	 */
+	terminateOnSettle?: boolean;
+
+	/**
 	 * Declares the bounded, validated effect of a finalized call that may execute
 	 * before ordinary dispatch commits its result.
 	 */

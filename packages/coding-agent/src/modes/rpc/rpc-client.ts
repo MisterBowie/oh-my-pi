@@ -1012,6 +1012,7 @@ export class RpcClient {
 			readsSkillUris: tool.readsSkillUris,
 			concurrency: tool.concurrency,
 			batchPolicy: tool.batchPolicy,
+			terminateOnSettle: tool.terminateOnSettle,
 		}));
 		const response = await this.#send({ type: "set_host_tools", tools: definitions });
 		return this.#getData<{ toolNames: string[] }>(response).toolNames;
