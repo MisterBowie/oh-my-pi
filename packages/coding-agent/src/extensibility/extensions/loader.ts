@@ -334,7 +334,13 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 		if (typeof action !== "function") {
 			return Promise.reject(new Error("this host does not support replacing the live system prompt"));
 		}
-		return Promise.resolve(action(prompt));
+		try {
+			return Promise.resolve(action(prompt));
+		} catch (error) {
+			// A refusing host throws synchronously; the action's contract is a
+			// rejection, so the caller can always await it.
+			return Promise.reject(error instanceof Error ? error : new Error(String(error)));
+		}
 	}
 
 	getCommands() {

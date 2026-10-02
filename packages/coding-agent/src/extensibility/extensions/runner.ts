@@ -98,6 +98,11 @@ function throwUnsupportedServiceTierAction(): never {
 	throw new Error("This extension host does not support service-tier actions");
 }
 
+/** A host that never provided the optional live prompt action must refuse it, not no-op. */
+function throwUnsupportedTurnSystemPromptAction(): never {
+	throw new Error("This extension host does not support replacing the live system prompt");
+}
+
 export function testSetExtensionHandlerTimeoutMs(timeoutMs: number): void {
 	extensionHandlerTimeoutMs = timeoutMs;
 }
@@ -686,6 +691,7 @@ export class ExtensionRunner {
 		this.runtime.setThinkingLevel = actions.setThinkingLevel;
 		this.runtime.getServiceTiers = actions.getServiceTiers ?? throwUnsupportedServiceTierAction;
 		this.runtime.setServiceTier = actions.setServiceTier ?? throwUnsupportedServiceTierAction;
+		this.runtime.setTurnSystemPrompt = actions.setTurnSystemPrompt ?? throwUnsupportedTurnSystemPromptAction;
 		this.runtime.getSessionName = actions.getSessionName;
 		this.runtime.setSessionName = actions.setSessionName;
 		this.runtime.registerProvider = (name, config, sourceId) => {

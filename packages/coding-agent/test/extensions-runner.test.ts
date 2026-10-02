@@ -24,6 +24,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import type {
 	Extension,
+	ExtensionAPI,
 	ExtensionError,
 	ExtensionServiceTier,
 	ExtensionUIContext,
@@ -205,6 +206,74 @@ describe("ExtensionRunner", () => {
 		expect(runner.createContext().getContextUsage()).toEqual(usage);
 		await runner.createContext().compact("preserve current task");
 		expect(compact).toHaveBeenCalledWith("preserve current task");
+	});
+
+	it("forwards the optional live system-prompt action to the extension API", async () => {
+		// Contract (M5/T20-D): a trusted host that provided the action must reach
+		// it through the extension API; a host that did not must refuse the call
+		// rather than silently keeping the old prompt.
+		fs.writeFileSync(
+			path.join(extensionsDir, "capture-live-prompt.ts"),
+			`export default function(pi) {
+				globalThis.__capturedLivePromptApi = pi;
+			}`,
+		);
+		const result = await loadTestExtensions();
+		const runner = new ExtensionRunner(
+			result.extensions,
+			result.runtime,
+			tempDir.path(),
+			sessionManager,
+			modelRegistry,
+		);
+		const seen: string[][] = [];
+		const actions = {
+			sendMessage: () => {},
+			sendUserMessage: () => {},
+			appendEntry: () => {},
+			setLabel: () => {},
+			getActiveTools: () => [],
+			getAllTools: () => [],
+			setActiveTools: async () => {},
+			setTurnSystemPrompt: async (prompt: string[]) => {
+				seen.push(prompt);
+			},
+			getCommands: () => [],
+			setModel: async () => false,
+			getThinkingLevel: () => undefined,
+			setThinkingLevel: () => {},
+			getSessionName: () => undefined,
+			setSessionName: async () => {},
+		};
+		const contextActions = {
+			getModel: () => undefined,
+			isIdle: () => true,
+			abort: () => {},
+			hasPendingMessages: () => false,
+			shutdown: () => {},
+			getContextUsage: () => undefined,
+			compact: async () => {},
+			getSystemPrompt: () => [],
+		};
+		const captured = globalThis as { __capturedLivePromptApi?: ExtensionAPI };
+		try {
+			runner.initialize(actions, contextActions, undefined, undefined, "rpc");
+			const pi = captured.__capturedLivePromptApi;
+			expect(pi).toBeDefined();
+			await pi?.setTurnSystemPrompt?.(["LIVE-PROMPT"]);
+			expect(seen).toEqual([["LIVE-PROMPT"]]);
+
+			// A host without the action (the interface marks it optional) refuses
+			// the call; it never degrades to "the old prompt stays".
+			const { setTurnSystemPrompt: _omitted, ...withoutAction } = actions;
+			runner.initialize(withoutAction, contextActions, undefined, undefined, "rpc");
+			await expect(pi?.setTurnSystemPrompt?.(["ignored"])).rejects.toThrow(
+				/does not support replacing the live system prompt/,
+			);
+			expect(seen).toEqual([["LIVE-PROMPT"]]);
+		} finally {
+			delete captured.__capturedLivePromptApi;
+		}
 	});
 
 	describe("shortcut conflicts", () => {
