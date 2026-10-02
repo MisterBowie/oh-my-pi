@@ -5432,6 +5432,24 @@ export class AgentSession {
 		return this.agent.state.systemPrompt;
 	}
 
+	/**
+	 * Replace the live per-turn system prompt (extension
+	 * `setTurnSystemPrompt`).
+	 *
+	 * Unlike a raw `agent.setSystemPrompt`, this registers the replacement as
+	 * the turn's own override: a base-prompt rebuild inside the same turn keeps
+	 * it, every provider request of the run re-reads it, and the next prompt
+	 * preparation drops it. That is what lets a trusted host change an
+	 * already-running turn's contract (for example a host-confirmed
+	 * Agent -> Plan/Goal transition) without restarting the run.
+	 */
+	setTurnSystemPrompt(prompt: string[]): void {
+		if (!Array.isArray(prompt) || prompt.length === 0 || prompt.some(part => typeof part !== "string")) {
+			throw new TypeError("setTurnSystemPrompt requires a non-empty array of system-prompt strings");
+		}
+		this.#tools.setTurnSystemPromptOverride([...prompt]);
+	}
+
 	/** Marks streamed text as committed or buffered for turn-recovery replay decisions. */
 	setTextOutputCommitted(committed: boolean): void {
 		this.#textOutputCommitted = committed;

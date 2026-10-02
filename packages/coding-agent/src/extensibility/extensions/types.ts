@@ -1460,6 +1460,23 @@ export interface ExtensionAPI {
 	/** Set the active tools by name. */
 	setActiveTools(toolNames: string[]): Promise<void>;
 
+	/**
+	 * Replace the live per-turn system prompt.
+	 *
+	 * The replacement is applied to the current run: every provider request
+	 * from here on — including requests that follow further tool calls in the
+	 * same run — uses it, because the agent loop re-reads the live prompt
+	 * before each model call. It is the mid-run counterpart of the
+	 * `before_agent_start` `systemPrompt` override and is dropped with that
+	 * override at the next prompt preparation, so a later turn is governed by
+	 * its own preparation again.
+	 *
+	 * Requires a non-empty array of strings; anything else is refused without
+	 * changing the live prompt. Hosts that do not provide this action reject
+	 * the call instead of silently keeping the old prompt.
+	 */
+	setTurnSystemPrompt?(prompt: string[]): Promise<void>;
+
 	/** Get available slash commands in the current session. */
 	getCommands(): SlashCommandInfo[];
 
@@ -1714,6 +1731,13 @@ export interface ExtensionActions {
 	getActiveTools: GetActiveToolsHandler;
 	getAllTools: GetAllToolsHandler;
 	setActiveTools: SetActiveToolsHandler;
+	/**
+	 * Replace the live per-turn system prompt (see
+	 * {@link ExtensionAPI.setTurnSystemPrompt}). Optional: hosts that do not
+	 * support mid-run prompt replacement leave it undefined and the API
+	 * refuses the call rather than pretending it succeeded.
+	 */
+	setTurnSystemPrompt?: (prompt: string[]) => Promise<void>;
 	getCommands: GetCommandsHandler;
 	setModel: SetModelHandler;
 	getThinkingLevel: GetThinkingLevelHandler;

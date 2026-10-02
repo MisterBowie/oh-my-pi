@@ -119,6 +119,7 @@ Core methods:
 - `setLabel`, `getFlag`
 - `sendMessage`, `sendUserMessage`, `appendEntry`, `exec`
 - `getActiveTools`, `getAllTools`, `setActiveTools`
+- `setTurnSystemPrompt` (optional; hosts that do not provide it reject the call)
 - `getCommands`
 - `getSessionName`, `setSessionName`
 - `setModel`, `getThinkingLevel`, `setThinkingLevel`
@@ -128,6 +129,8 @@ Core methods:
 - `events` (shared event bus)
 
 `ExtensionAPI` methods retain their extension binding when destructured or passed as callbacks.
+
+`setTurnSystemPrompt(prompt)` replaces the live per-turn system prompt for the current run: every provider request from that point on — including requests after further tool calls in the same run — uses the replacement, because the agent loop re-reads the live prompt before each model call. It is the mid-run counterpart of the `before_agent_start` `systemPrompt` override and is dropped together with that override when the next prompt is prepared. It requires a non-empty array of strings and refuses anything else without touching the live prompt.
 
 `getServiceTiers()` returns a detached snapshot of the session's live per-family tier map. `setServiceTier(family, tier)` changes one family for subsequent requests; pass `undefined` to clear that session override. OpenAI accepts `auto`, `default`, `flex`, `scale`, or `priority`; Anthropic accepts `priority`; Google accepts `flex` or `priority`. Changes made while a response is streaming do not alter that in-flight request.
 

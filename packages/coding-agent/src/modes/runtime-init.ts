@@ -105,6 +105,12 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			getActiveTools: () => session.getEnabledToolNames(),
 			getAllTools: () => session.getAllToolInfos(),
 			setActiveTools: (toolNames: string[]) => session.setActiveToolsByName(toolNames),
+			// The mid-run counterpart of the `before_agent_start` override
+			// (M5/T20-D): a trusted host that already committed a contract-mode
+			// transition can make the live run's remaining provider requests use
+			// the new prompt. The session validates the array and keeps the
+			// override until the run ends.
+			setTurnSystemPrompt: async (prompt: string[]) => session.setTurnSystemPrompt(prompt),
 			getCommands: () => getSessionSlashCommands(session),
 			setModel: model => runExtensionSetModel(session, model),
 			getThinkingLevel: () => session.thinkingLevel,

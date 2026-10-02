@@ -324,6 +324,19 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 		return this.runtime.setActiveTools(toolNames);
 	}
 
+	/**
+	 * Replace the live per-turn system prompt. A host that does not provide the
+	 * action refuses the call; silently keeping the old prompt would let a
+	 * caller believe a contract change it never got.
+	 */
+	setTurnSystemPrompt(prompt: string[]): Promise<void> {
+		const action = this.runtime.setTurnSystemPrompt;
+		if (typeof action !== "function") {
+			return Promise.reject(new Error("this host does not support replacing the live system prompt"));
+		}
+		return Promise.resolve(action(prompt));
+	}
+
 	getCommands() {
 		return this.runtime.getCommands();
 	}
