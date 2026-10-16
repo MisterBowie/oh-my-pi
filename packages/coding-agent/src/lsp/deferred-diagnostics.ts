@@ -14,15 +14,18 @@ export class DeferredDiagnostics {
 	) {}
 
 	/** Begin a file mutation and return the handle consumed by LSP writethrough. */
-	begin(path: string): WritethroughDeferredHandle {
+	begin(path: string): WritethroughDeferredHandle | undefined {
 		const existing = this.#pendingFetches.get(path);
 		if (existing) {
 			existing.abort();
 			this.#pendingFetches.delete(path);
 		}
 
-		const controller = new AbortController();
 		const mutationVersion = this.#bumpVersion(path);
+		// RPC hosts may close the owning turn before an idle injection arrives.
+		// Keep diagnostics in the tool's bounded, cancellable writethrough there.
+		if (!this.session.settings.get("lsp.diagnosticsDeferred")) return undefined;
+		const controller = new AbortController();
 		return {
 			onDeferredDiagnostics: diagnostics => {
 				this.#pendingFetches.delete(path);

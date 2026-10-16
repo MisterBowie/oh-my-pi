@@ -8,6 +8,17 @@ Source of truth in code:
 - Config loader: `packages/coding-agent/src/lsp/config.ts`
 - Built-in server definitions: `packages/coding-agent/src/lsp/defaults.json`
 
+## Diagnostic delivery
+
+`lsp.diagnosticsOnWrite` enables checking newly written files;
+`lsp.diagnosticsOnEdit` enables checking edits to existing files.
+`lsp.diagnosticsDeferred` defaults to `true`, preserving asynchronous late
+diagnostics for interactive sessions. An RPC host that completes its turn at
+`agent_end` can set it to `false`: write/edit then return diagnostics in their
+own tool result using the existing bounded diagnostic pipeline and caller
+cancellation. Slow or failed servers remain observable in that result; they
+do not start a later unowned model continuation.
+
 ## Auto-detection
 
 When no config file contributes a server override, OMP auto-detects built-in servers by intersecting two conditions:

@@ -3881,6 +3881,11 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"lsp.diagnosticsDeferred": {
+		type: "boolean",
+		default: true,
+	},
+
 	"lsp.diagnosticsDeduplicate": {
 		type: "boolean",
 		default: true,

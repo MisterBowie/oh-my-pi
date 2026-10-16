@@ -732,7 +732,7 @@ describe("LSP diagnostics freshness", () => {
 		expect(await Bun.file(filePath).text()).toBe("export const value: number = 'x';\n");
 	});
 
-	it("returns the write tool result before slow diagnostics and queues them for the agent", async () => {
+	it.each([true, false])("settles slow write diagnostics with deferred delivery=%s", async deferred => {
 		const filePath = path.join(tempDir.path(), "write-tool.ts");
 		const uri = fileToUri(filePath);
 		const client = createClient(tempDir.path(), TEST_SERVER);
@@ -763,6 +763,7 @@ describe("LSP diagnostics freshness", () => {
 				"lsp.formatOnWrite": false,
 				"lsp.diagnosticsOnWrite": true,
 				"lsp.diagnosticsDeduplicate": true,
+				"lsp.diagnosticsDeferred": deferred,
 			}),
 			enableLsp: true,
 			queueDeferredDiagnostics: entry => queued.resolve(entry),
@@ -779,11 +780,18 @@ describe("LSP diagnostics freshness", () => {
 			content: "export const value: number = 'x';\n",
 		});
 
-		expect(result.details?.diagnostics).toBeUndefined();
-		const late = await queued.promise;
-		expect(late.isStale()).toBe(false);
-		expect(late.errored).toBe(true);
-		expect(late.messages.some(message => message.includes("write tool deferred error"))).toBe(true);
+		if (deferred) {
+			expect(result.details?.diagnostics).toBeUndefined();
+			const late = await queued.promise;
+			expect(late.isStale()).toBe(false);
+			expect(late.errored).toBe(true);
+			expect(late.messages.some(message => message.includes("write tool deferred error"))).toBe(true);
+		} else {
+			expect(result.details?.diagnostics?.errored).toBe(true);
+			expect(
+				result.details?.diagnostics?.messages.some(message => message.includes("write tool deferred error")),
+			).toBe(true);
+		}
 		expect(await Bun.file(filePath).text()).toBe("export const value: number = 'x';\n");
 	});
 
