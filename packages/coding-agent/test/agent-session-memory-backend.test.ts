@@ -11,6 +11,7 @@ import { rebindMemoryBackendForCwd } from "@oh-my-pi/pi-coding-agent/hindsight/b
 import { MEMORY_BACKEND_TOOL_NAMES } from "@oh-my-pi/pi-coding-agent/memory-backend/tool-names";
 import { computeMnemopiBankScope } from "@oh-my-pi/pi-coding-agent/mnemopi/config";
 import { getMnemopiSessionState } from "@oh-my-pi/pi-coding-agent/mnemopi/state";
+import { executeMemoryRpc } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-memory";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -94,6 +95,52 @@ describe("AgentSession memory backend lifecycle", () => {
 		});
 		return session;
 	}
+
+	it("desktop memory keeps later turns, supports browsing/search/clear, and does not resurrect cleared history", async () => {
+		settings.override("memory.backend", "mnemopi");
+		settings.override("mnemopi.dbPath", path.join(tempDir.path(), "desktop.db"));
+		settings.override("mnemopi.scoping", "global");
+		settings.override("mnemopi.retainFromSessionStart", true);
+		settings.override("mnemopi.retainEveryNTurns", 1);
+		settings.override("mnemopi.autoRecall", false);
+		const current = createSession(async () => []);
+		current.sessionManager.appendMessage({ role: "user", content: "old-history-marker", timestamp: 1 });
+		await current.applyMemoryBackend();
+		const state = getMnemopiSessionState(current)!;
+		expect(state.lastRetainedTurn).toBe(1);
+		current.sessionManager.appendMessage({
+			role: "user",
+			content: "Remember desktop-memory-marker for this project",
+			timestamp: 2,
+		});
+		await state.maybeRetainOnAgentEnd([]);
+		const page = (await executeMemoryRpc(current, { action: "list" })) as {
+			total: number;
+			items: Array<{ content: string }>;
+		};
+		expect(page.total).toBeGreaterThan(0);
+		expect(JSON.stringify(page.items)).toContain("desktop-memory-marker");
+		expect(JSON.stringify(page.items)).not.toContain("old-history-marker");
+		state.memory.beam.db.run(
+			"INSERT INTO facts (fact_id, session_id, subject, predicate, object) VALUES (?, ?, ?, ?, ?)",
+			["desktop-fact", current.sessionId, "database", "uses", "native-fact-marker"],
+		);
+		const withFacts = (await executeMemoryRpc(current, { action: "list" })) as { items: Array<{ content: string }> };
+		expect(JSON.stringify(withFacts.items)).toContain("native-fact-marker");
+		const found = (await executeMemoryRpc(current, { action: "search", query: "desktop-memory-marker" })) as {
+			items: unknown[];
+		};
+		expect(found.items.length).toBeGreaterThan(0);
+		expect(await state.beforeAgentStartPrompt("desktop-memory-marker")).toBeUndefined();
+		expect(
+			await state.recallForCompaction([{ role: "user", content: "desktop-memory-marker", timestamp: 3 }]),
+		).toBeUndefined();
+		expect(await executeMemoryRpc(current, { action: "clear" })).toEqual({ cleared: true });
+		await getMnemopiSessionState(current)!.maybeRetainOnAgentEnd([]);
+		expect(((await executeMemoryRpc(current, { action: "list" })) as { total: number }).total).toBe(0);
+		await expect(executeMemoryRpc(current, { action: "list", limit: 0 })).rejects.toThrow("Invalid memory page");
+		await expect(executeMemoryRpc(current, { action: "search", query: {} })).rejects.toThrow("Invalid memory query");
+	});
 
 	it("removes unusable Hindsight tools after a cwd reload clears the URL and restores them when configured", async () => {
 		const apiUrl = "http://127.0.0.1:1";

@@ -48,6 +48,7 @@ import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameEncoder } from 
 import { claimRpcInput, readRpcInputFrames } from "./rpc-input";
 import { pageRpcMessages, RPC_MESSAGES_PAGE_BUSY_ERROR, RpcMessagesPageError } from "./rpc-messages";
 import { RpcOutputWriter } from "./rpc-output";
+import { executeMemoryRpc } from "./rpc-memory";
 import { RpcSubagentRegistry, readRpcSubagentTranscript } from "./rpc-subagents";
 import type {
 	RpcCommand,
@@ -1181,6 +1182,9 @@ export async function runRpcMode(
 		const id = command.id;
 
 		switch (command.type) {
+			case "memory": {
+				return success(id, "memory", await executeMemoryRpc(session, command));
+			}
 			case "negotiate_protocol": {
 				if (command.protocolVersion !== 2)
 					return error(id, "negotiate_protocol", `Unsupported RPC protocol version: ${command.protocolVersion}`);
@@ -1291,7 +1295,24 @@ export async function runRpcMode(
 			// =================================================================
 
 			case "get_state": {
+				const memoryJobs = session.getAsyncJobSnapshot();
 				const state: RpcSessionState = {
+					memoryRpcVersion: 1,
+					memoryMaintenanceSafe:
+						!session.isStreaming &&
+						!session.isBashRunning &&
+						!session.isEvalRunning &&
+						!session.isGeneratingHandoff &&
+						!session.isCompacting &&
+						session.queuedMessageCount === 0 &&
+						(memoryJobs?.running.length ?? 0) === 0 &&
+						(memoryJobs?.delivery.queued ?? 0) === 0 &&
+						!memoryJobs?.delivery.delivering &&
+						!(
+							subagentRegistry
+								?.getSubagents()
+								.some(child => child.status === "running" || child.status === "pending") ?? false
+						),
 					model: session.model,
 					thinkingLevel: session.thinkingLevel,
 					isStreaming: session.isStreaming,

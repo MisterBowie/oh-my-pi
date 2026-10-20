@@ -979,3 +979,24 @@ with RpcClient(provider="anthropic", model="claude-sonnet-4-5") as client:
 ```
 
 By default, `RpcClient` starts `omp --mode rpc`; pass `command=[...]` to own the exact child command. It handles request correlation, typed notifications, v2 negotiation and chunk reassembly, message pagination, extension UI, and host-owned tools and URI schemes. The Python package owns that client API and process lifecycle; this document and `rpc-types.ts` remain the canonical wire contract. Use raw protocol frames when a client library does not wrap the surface you need.
+
+### Desktop memory management (candidate)
+
+`get_state` advertises `memoryRpcVersion: 1` and `memoryMaintenanceSafe`.
+The latter is false while streaming, compacting, queued prompts, background jobs,
+pending async delivery, or child agents can still use the runtime.
+
+The `memory` command accepts `action: "status" | "list" | "search" | "clear"`.
+`list` uses an optional `offset` (0–100000) and `limit` (1–100, default 50).
+`search` requires a nonempty `query` of at most 2000 characters. Responses use
+the usual RPC response envelope. Browsing returns `{ backend, total, offset,
+items }`, with bounded content from active working, episodic and extracted fact records.
+Management requires an idle session and does not append a model turn. Desktop
+hosts use a separate credential-free process with auto-retain and auto-recall
+disabled, and reclaim all writers before clearing a project store.
+
+`mnemopi.retainFromSessionStart` defaults to false for CLI compatibility. When
+true, enabling/resuming starts automatic retention after the transcript already
+loaded into the session. Clearing and rebinding also establish this baseline so
+old messages are not silently imported again. `mnemopi.autoRecall: false` also
+suppresses recall during compaction.

@@ -3286,6 +3286,7 @@ export const SETTINGS_SCHEMA = {
 			condition: "mnemopiActive",
 		},
 	},
+	"mnemopi.retainFromSessionStart": { type: "boolean", default: false },
 	"mnemopi.retainEveryNTurns": { type: "number", default: 4 },
 	"mnemopi.recallLimit": { type: "number", default: 8 },
 	"mnemopi.recallContextTurns": { type: "number", default: 3 },

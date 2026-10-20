@@ -24,6 +24,7 @@ export interface MnemopiBackendConfig {
 	scoping?: MnemopiScoping;
 	autoRecall: boolean;
 	autoRetain: boolean;
+	retainFromSessionStart?: boolean;
 	polyphonicRecall: boolean;
 	enhancedRecall: boolean;
 	proactiveLinking: boolean;
@@ -72,6 +73,7 @@ export function loadMnemopiConfig(settings: Settings, agentDir: string): Mnemopi
 		scoping,
 		autoRecall: settings.get("mnemopi.autoRecall"),
 		autoRetain: settings.get("mnemopi.autoRetain"),
+		retainFromSessionStart: settings.get("mnemopi.retainFromSessionStart"),
 		polyphonicRecall: settings.get("mnemopi.polyphonicRecall"),
 		enhancedRecall: settings.get("mnemopi.enhancedRecall"),
 		proactiveLinking: settings.get("mnemopi.proactiveLinking"),

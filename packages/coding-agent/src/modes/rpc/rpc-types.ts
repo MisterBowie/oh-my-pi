@@ -35,6 +35,14 @@ export type RpcCommand =
 
 	// State
 	| { id?: string; type: "get_state" }
+	| {
+			id?: string;
+			type: "memory";
+			action: "status" | "list" | "search" | "clear";
+			query?: string;
+			offset?: number;
+			limit?: number;
+	  }
 	| { id?: string; type: "set_fast_mode"; enabled: boolean }
 	| { id?: string; type: "get_available_commands" }
 	| { id?: string; type: "get_entries"; since?: string }
@@ -96,6 +104,8 @@ export type RpcCommand =
 // ============================================================================
 
 export interface RpcSessionState {
+	memoryRpcVersion?: 1;
+	memoryMaintenanceSafe?: boolean;
 	model?: Model;
 	thinkingLevel: ThinkingLevel | undefined;
 	isStreaming: boolean;
@@ -212,6 +222,7 @@ export type RpcResponse =
 
 	// State
 	| { id?: string; type: "response"; command: "get_state"; success: true; data: RpcSessionState }
+	| { id?: string; type: "response"; command: "memory"; success: true; data: object }
 	| {
 			id?: string;
 			type: "response";

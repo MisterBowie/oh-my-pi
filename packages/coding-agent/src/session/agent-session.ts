@@ -5647,6 +5647,11 @@ export class AgentSession {
 		this.#memory.endLocalMemoryStartup(signal);
 	}
 
+	/** Wait for startup and settings-driven memory transitions without restarting the backend. */
+	waitForMemoryBackend(): Promise<void> {
+		return this.#memory.transition;
+	}
+
 	/** Apply the backend; cwd rebinding can skip Mnemopi auto-retention while still draining writes. */
 	applyMemoryBackend(options: { retainMnemopi?: boolean } = {}): Promise<void> {
 		if (!this.memoryEnabled) return Promise.resolve();

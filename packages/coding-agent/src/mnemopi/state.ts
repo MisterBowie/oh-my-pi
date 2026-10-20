@@ -250,7 +250,11 @@ export class MnemopiSessionState {
 		this.config = options.config;
 		this.session = options.session;
 		this.aliasOf = options.aliasOf;
-		this.lastRetainedTurn = options.lastRetainedTurn ?? 0;
+		this.lastRetainedTurn =
+			options.lastRetainedTurn ??
+			(options.config.retainFromSessionStart
+				? extractMessages(options.session.sessionManager).filter(message => message.role === "user").length
+				: 0);
 		this.hasRecalledForFirstTurn = options.hasRecalledForFirstTurn ?? false;
 		this.scoped = options.aliasOf?.scoped ?? createScopedResources(options.config);
 		this.memory = this.scoped.retain.memory;
@@ -261,13 +265,17 @@ export class MnemopiSessionState {
 		if (this.sessionId === sessionId) return;
 		this.#recallGeneration++;
 		this.sessionId = sessionId;
-		this.lastRetainedTurn = 0;
+		this.lastRetainedTurn = this.config.retainFromSessionStart
+			? extractMessages(this.session.sessionManager).filter(message => message.role === "user").length
+			: 0;
 		this.#retentionCursorLoaded = false;
 	}
 
 	resetConversationTracking(): void {
 		this.#recallGeneration++;
-		this.lastRetainedTurn = 0;
+		this.lastRetainedTurn = this.config.retainFromSessionStart
+			? extractMessages(this.session.sessionManager).filter(message => message.role === "user").length
+			: 0;
 		this.#retentionCursorLoaded = false;
 		this.hasRecalledForFirstTurn = false;
 		this.lastRecallSnippet = undefined;
@@ -503,6 +511,7 @@ export class MnemopiSessionState {
 	}
 
 	async recallForCompaction(messages: AgentMessage[]): Promise<string | undefined> {
+		if (!this.config.autoRecall) return undefined;
 		const flat = flattenAgentMessages(messages);
 		const lastUser = flat.findLast(message => message.role === "user");
 		if (!lastUser) return undefined;
